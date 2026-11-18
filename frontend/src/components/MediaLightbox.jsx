@@ -1,0 +1,210 @@
+import React, { useEffect } from 'react';
+import ReactDOM from 'react-dom';
+import { X, ChevronLeft, ChevronRight, Trash2 } from 'lucide-react';
+import { useModalA11y } from '../utils/a11y';
+
+export default function MediaLightbox({ mediaMessages, initialIndex, onClose, currentUser, onDelete }) {
+    const [currentIndex, setCurrentIndex] = React.useState(initialIndex || 0);
+    // Escape, focus trap and focus restore; the arrow keys are handled below.
+    const dialogRef = useModalA11y(onClose, !!(mediaMessages && mediaMessages.length));
+
+    useEffect(() => {
+        if (!mediaMessages || mediaMessages.length === 0) {
+            onClose();
+        } else if (currentIndex >= mediaMessages.length) {
+            setCurrentIndex(Math.max(0, mediaMessages.length - 1));
+        }
+    }, [mediaMessages, currentIndex, onClose]);
+
+    useEffect(() => {
+        const handleKeyDown = (e) => {
+
+            if (e.key === 'ArrowRight') handleNext();
+            if (e.key === 'ArrowLeft') handlePrev();
+        };
+        window.addEventListener('keydown', handleKeyDown);
+        return () => window.removeEventListener('keydown', handleKeyDown);
+    }, [currentIndex, mediaMessages]);
+
+    const handleNext = () => {
+        if (!mediaMessages || mediaMessages.length === 0) return;
+        setCurrentIndex((prev) => (prev + 1) % mediaMessages.length);
+    };
+
+    const handlePrev = () => {
+        if (!mediaMessages || mediaMessages.length === 0) return;
+        setCurrentIndex((prev) => (prev - 1 + mediaMessages.length) % mediaMessages.length);
+    };
+
+    if (!mediaMessages || mediaMessages.length === 0) return null;
+
+    const safeIndex = Math.min(Math.max(0, currentIndex), mediaMessages.length - 1);
+    const currentMedia = mediaMessages[safeIndex];
+    if (!currentMedia) return null;
+
+    const mediaUrl = currentMedia.mediaUrl || currentMedia.url || (typeof currentMedia === 'string' ? currentMedia : '');
+    const mediaType = currentMedia.mediaType || currentMedia.type || (typeof mediaUrl === 'string' && mediaUrl.match(/\.(mp4|webm|mov|ogg)(\?.*)?$/i) ? 'video' : 'image');
+    const isImage = mediaType === 'image';
+
+    return ReactDOM.createPortal(
+        <div ref={dialogRef} role="dialog" aria-modal="true" aria-label="Media viewer" tabIndex={-1} style={{
+            position: 'fixed',
+            top: 0,
+            left: 0,
+            width: '100vw',
+            height: '100vh',
+            backgroundColor: 'rgba(0, 0, 0, 0.9)',
+            backdropFilter: 'blur(8px)',
+            zIndex: 999999,
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center'
+        }}>
+            {/* Close Button */}
+            <button
+                onClick={onClose}
+                aria-label="Close"
+                style={{
+                    position: 'absolute',
+                    top: '20px',
+                    right: '20px',
+                    background: 'rgba(255, 255, 255, 0.1)',
+                    border: 'none',
+                    color: 'white',
+                    width: '48px',
+                    height: '48px',
+                    borderRadius: '50%',
+                    cursor: 'pointer',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    zIndex: 2,
+                    transition: 'background 0.2s'
+                }}
+                onMouseOver={e => e.currentTarget.style.background = 'rgba(255, 255, 255, 0.2)'}
+                onMouseOut={e => e.currentTarget.style.background = 'rgba(255, 255, 255, 0.1)'}
+            >
+                <X size={24} />
+            </button>
+
+            {/* Previous Button */}
+            {mediaMessages.length > 1 && (
+                <button
+                    onClick={handlePrev}
+                    aria-label="Previous"
+                    style={{
+                        position: 'absolute',
+                        left: '20px',
+                        background: 'rgba(255, 255, 255, 0.1)',
+                        border: 'none',
+                        color: 'white',
+                        width: '48px',
+                        height: '48px',
+                        borderRadius: '50%',
+                        cursor: 'pointer',
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                        zIndex: 2,
+                        transition: 'background 0.2s'
+                    }}
+                    onMouseOver={e => e.currentTarget.style.background = 'rgba(255, 255, 255, 0.2)'}
+                    onMouseOut={e => e.currentTarget.style.background = 'rgba(255, 255, 255, 0.1)'}
+                >
+                    <ChevronLeft size={32} />
+                </button>
+            )}
+
+            {/* Media Content */}
+            <div style={{ maxWidth: '90vw', maxHeight: '90vh', position: 'relative' }}>
+                {isImage ? (
+                    <img 
+                        src={mediaUrl} 
+                        alt="attachment" 
+                        style={{ maxWidth: '100%', maxHeight: '90vh', objectFit: 'contain', borderRadius: '8px', boxShadow: '0 10px 40px rgba(0,0,0,0.5)' }} 
+                    />
+                ) : (
+                    <video 
+                        controls 
+                        autoPlay
+                        style={{ maxWidth: '100%', maxHeight: '90vh', objectFit: 'contain', borderRadius: '8px', boxShadow: '0 10px 40px rgba(0,0,0,0.5)' }}
+                    >
+                        <source src={mediaUrl} type="video/mp4" />
+                        Your browser does not support the video tag.
+                    </video>
+                )}
+            </div>
+
+            {/* Next Button */}
+            {mediaMessages.length > 1 && (
+                <button
+                    onClick={handleNext}
+                    aria-label="Next"
+                    style={{
+                        position: 'absolute',
+                        right: '20px',
+                        background: 'rgba(255, 255, 255, 0.1)',
+                        border: 'none',
+                        color: 'white',
+                        width: '48px',
+                        height: '48px',
+                        borderRadius: '50%',
+                        cursor: 'pointer',
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                        zIndex: 2,
+                        transition: 'background 0.2s'
+                    }}
+                    onMouseOver={e => e.currentTarget.style.background = 'rgba(255, 255, 255, 0.2)'}
+                    onMouseOut={e => e.currentTarget.style.background = 'rgba(255, 255, 255, 0.1)'}
+                >
+                    <ChevronRight size={32} />
+                </button>
+            )}
+
+            {/* Delete Button */}
+            {currentMedia?.sender?.username && currentMedia.sender.username === currentUser?.username && onDelete && (
+                <button 
+                    onClick={() => onDelete(currentMedia._id)}
+                    style={{
+                        position: 'absolute',
+                        bottom: '20px',
+                        right: '20px',
+                        background: 'rgba(239, 68, 68, 0.2)',
+                        border: 'none',
+                        color: '#ef4444',
+                        width: '48px',
+                        height: '48px',
+                        borderRadius: '50%',
+                        cursor: 'pointer',
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                        zIndex: 2,
+                        transition: 'background 0.2s'
+                    }}
+                    onMouseOver={e => e.currentTarget.style.background = 'rgba(239, 68, 68, 0.4)'}
+                    onMouseOut={e => e.currentTarget.style.background = 'rgba(239, 68, 68, 0.2)'}
+                    title="Delete Media"
+                >
+                    <Trash2 size={24} />
+                </button>
+            )}
+
+            {/* Counter */}
+            <div style={{
+                position: 'absolute',
+                bottom: '20px',
+                color: 'rgba(255,255,255,0.7)',
+                fontSize: '0.9rem',
+                background: 'rgba(0,0,0,0.5)',
+                padding: '4px 12px',
+                borderRadius: '999px'
+            }}>
+                {currentIndex + 1} / {mediaMessages.length}
+            </div>
+        </div>,
+        document.body
+    );
+}
