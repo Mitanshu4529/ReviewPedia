@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { API_BASE_URL } from '../config';
 import { useNavigate } from 'react-router-dom';
-import { X, MapPin, Calendar, CheckCircle, Image as ImageIcon, Trash2, Pencil, Heart, MessageSquare } from 'lucide-react';
+import { X, Calendar, CheckCircle, Image as ImageIcon, Trash2, Pencil, Heart, MessageSquare } from 'lucide-react';
 import '../index.css';
 import ConfirmModal from './ConfirmModal';
 import MediaLightbox from './MediaLightbox';
@@ -9,7 +9,7 @@ import { formatDate } from '../utils/dateUtils';
 import { getReviewUrl } from '../utils/urlUtils';
 import ReviewClampedText from './ReviewClampedText';
 import StarRating from './StarRating';
-import { getJsonAuthHeaders, getAuthHeaders } from '../utils/apiUtils';
+import { getJsonAuthHeaders, getAuthHeaders, errorMessage, readJson } from '../utils/apiUtils';
 import { notify } from '../utils/notify';
 import { pressable } from '../utils/a11y';
 
@@ -57,6 +57,10 @@ export default function MultiReviewCard({ reviews, onClose, onUserClick, current
       ? currentLikes.filter(id => id !== currentUserId && id !== currentUser.id?.toString() && id !== currentUser._id?.toString() && id !== currentUser.username)
       : [...currentLikes, currentUserId];
 
+    const rollback = () => {
+      setLikesState(prev => ({ ...prev, [reviewId]: currentLikes }));
+      if (onLikeToggle) onLikeToggle(reviewId, currentLikes);
+    };
     setLikesState(prev => ({
       ...prev,
       [reviewId]: updatedLikes
@@ -73,20 +77,23 @@ export default function MultiReviewCard({ reviews, onClose, onUserClick, current
         headers: getJsonAuthHeaders(),
         credentials: 'include'
       });
-      if (res.ok) {
-        const data = await res.json();
-        if (data.likes) {
-          setLikesState(prev => ({
-            ...prev,
-            [reviewId]: data.likes
-          }));
-          if (onLikeToggle) {
-            onLikeToggle(reviewId, data.likes);
-          }
+      const data = await readJson(res);
+      if (res.ok && Array.isArray(data.likes)) {
+        setLikesState(prev => ({
+          ...prev,
+          [reviewId]: data.likes
+        }));
+        if (onLikeToggle) {
+          onLikeToggle(reviewId, data.likes);
         }
+      } else {
+        rollback();
+        notify(errorMessage(data, 'Could not update the like.'));
       }
     } catch (err) {
       console.error("Failed to toggle like:", err);
+      rollback();
+      notify('Could not update the like. Please check your connection.');
     }
   };
 
@@ -123,8 +130,7 @@ export default function MultiReviewCard({ reviews, onClose, onUserClick, current
           if (res.ok) {
             if (onDeleteSuccess) onDeleteSuccess(reviewId);
           } else {
-            const data = await res.json();
-            notify(data.error || "Failed to delete review");
+            notify(errorMessage(await readJson(res), "Failed to delete review"));
           }
         } catch (err) {
           console.error(err);
@@ -184,8 +190,9 @@ export default function MultiReviewCard({ reviews, onClose, onUserClick, current
                   aria-label={`Open review of ${review.product?.name || 'this product'}`}
                   style={{ display: 'flex', flexDirection: 'column', gap: 16, padding: '20px', backgroundColor: '#F8F4F0', borderRadius: '12px', border: '1px solid #e4e4e7', color: '#18181b', position: 'relative' }}
                 >
+                    {/* Same rule as the server: the account that wrote it, matched by id
+                        (a name match would also hit imported reviews by a namesake). */}
                     {currentUser && (
-                        currentUser.username === review.user?.name ||
                         (currentUser.id && review.user?.id && (currentUser.id === review.user.id || currentUser.id.toString() === review.user.id.toString())) ||
                         (currentUser._id && review.user?.id && (currentUser._id === review.user.id || currentUser._id.toString() === review.user.id.toString()))
                     ) && (

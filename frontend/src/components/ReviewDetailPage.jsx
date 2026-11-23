@@ -2,8 +2,8 @@ import React, { useState, useEffect, useRef } from 'react';
 import { API_BASE_URL } from '../config';
 import { useNavigate, useParams, useLocation } from 'react-router-dom';
 import { 
-  ArrowLeft, Star, Heart, MessageSquare, Share2, 
-  CheckCircle, Calendar, Check, Sparkles, User as UserIcon,
+  ArrowLeft, Heart, MessageSquare, Share2, 
+  CheckCircle, Calendar, Check,
   ExternalLink, Plus, Pencil, ShoppingBag, Loader2, Trash2
 } from 'lucide-react';
 import CommentSection from './CommentSection';
@@ -15,11 +15,11 @@ import ChatIcon from './ChatIcon';
 import { useChat } from '../context/ChatContext';
 import { formatDate } from '../utils/dateUtils';
 import { extractReviewId } from '../utils/urlUtils';
-import { getJsonAuthHeaders, getAuthHeaders } from '../utils/apiUtils';
+import { getJsonAuthHeaders, errorMessage, readJson } from '../utils/apiUtils';
 import { pressable } from '../utils/a11y';
 import { notify } from '../utils/notify';
 
-export default function ReviewDetailPage({ currentUser, logout, onOpenMyReviews, onOpenAuth, onLikeToggle, onUserClick }) {
+export default function ReviewDetailPage({ currentUser, logout, onOpenAuth, onLikeToggle, onUserClick }) {
   const navigate = useNavigate();
   const location = useLocation();
   const params = useParams();
@@ -59,8 +59,13 @@ export default function ReviewDetailPage({ currentUser, logout, onOpenMyReviews,
         setIsProfileMenuOpen(false);
       }
     };
+    const handleKeyDown = (e) => { if (e.key === 'Escape') setIsProfileMenuOpen(false); };
     document.addEventListener('mousedown', handleClickOutside);
-    return () => document.removeEventListener('mousedown', handleClickOutside);
+    document.addEventListener('keydown', handleKeyDown);
+    return () => {
+      document.removeEventListener('mousedown', handleClickOutside);
+      document.removeEventListener('keydown', handleKeyDown);
+    };
   }, []);
 
   // Fetch review details
@@ -182,6 +187,11 @@ export default function ReviewDetailPage({ currentUser, logout, onOpenMyReviews,
       ? localLikes.filter(id => id !== currentUserId)
       : [...localLikes, currentUserId];
 
+    const previous = localLikes;
+    const rollback = () => {
+      setLocalLikes(previous);
+      if (onLikeToggle) onLikeToggle(reviewId, previous);
+    };
     setLocalLikes(updated);
     if (onLikeToggle) {
       onLikeToggle(reviewId, updated);
@@ -193,23 +203,37 @@ export default function ReviewDetailPage({ currentUser, logout, onOpenMyReviews,
         headers: getJsonAuthHeaders(),
         credentials: 'include'
       });
-      if (res.ok) {
-        const data = await res.json();
-        if (data.likes) {
-          setLocalLikes(data.likes);
-          if (onLikeToggle) onLikeToggle(reviewId, data.likes);
-        }
+      const data = await readJson(res);
+      if (res.ok && Array.isArray(data.likes)) {
+        setLocalLikes(data.likes);
+        if (onLikeToggle) onLikeToggle(reviewId, data.likes);
+      } else {
+        rollback();
+        notify(errorMessage(data, 'Could not update the like.'));
       }
     } catch (err) {
       console.error("Failed to toggle like:", err);
+      rollback();
+      notify('Could not update the like. Please check your connection.');
     }
   };
 
   // Handle share click
-  const handleShare = () => {
-    navigator.clipboard.writeText(window.location.href);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 2500);
+  // navigator.clipboard only exists on secure (https / localhost) pages, and
+  // writing can be refused; "Link Copied!" is shown only when it worked.
+  const copiedTimer = useRef(null);
+  useEffect(() => () => clearTimeout(copiedTimer.current), []);
+  const handleShare = async () => {
+    try {
+      if (!navigator.clipboard?.writeText) throw new Error('Clipboard unavailable');
+      await navigator.clipboard.writeText(window.location.href);
+      setCopied(true);
+      clearTimeout(copiedTimer.current);
+      copiedTimer.current = setTimeout(() => setCopied(false), 2500);
+    } catch {
+      notify(`Could not copy the link. You can copy it from the address bar:
+${window.location.href}`, { type: 'info' });
+    }
   };
 
   const scrollToComments = () => {
@@ -228,7 +252,6 @@ export default function ReviewDetailPage({ currentUser, logout, onOpenMyReviews,
 
   const isOwner = Boolean(
     currentUser && review && (
-      (currentUser.username && review.user?.name && currentUser.username === review.user.name) ||
       (currentUser.id && review.user?.id && (currentUser.id === review.user.id || currentUser.id.toString() === review.user.id.toString())) ||
       (currentUser._id && review.user?.id && (currentUser._id === review.user.id || currentUser._id.toString() === review.user.id.toString())) ||
       (currentUser.role === 'admin')
@@ -287,7 +310,7 @@ export default function ReviewDetailPage({ currentUser, logout, onOpenMyReviews,
         setIsEditingPurchase(false);
       } else {
         const errData = await res.json().catch(() => ({}));
-        notify(errData.error || 'Failed to update purchase info');
+        notify(errorMessage(errData, 'Failed to update purchase info'));
       }
     } catch (err) {
       console.error('Error saving purchase info:', err);

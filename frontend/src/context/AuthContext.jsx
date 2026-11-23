@@ -1,7 +1,8 @@
-import React, { createContext, useContext, useState, useEffect } from 'react';
+import React, { createContext, useContext, useState, useEffect, useRef } from 'react';
 
 import { API_BASE_URL } from '../config';
-import { getAuthHeaders, setAuthToken, removeAuthToken } from '../utils/apiUtils';
+import { getAuthHeaders, setAuthToken, removeAuthToken, errorMessage, readJson, watchSessionExpiry } from '../utils/apiUtils';
+import { notify } from '../utils/notify';
 
 const AuthContext = createContext();
 
@@ -40,6 +41,18 @@ export const AuthProvider = ({ children }) => {
         fetchUser();
     }, [API_URL]);
 
+    // A 401 on any signed-in request means the session ended (token expired,
+    // password reset elsewhere, account deleted): sign out locally and say so.
+    const userRef = useRef(null);
+    userRef.current = user;
+    useEffect(() => watchSessionExpiry(() => {
+        removeAuthToken();
+        if (userRef.current) {
+            notify('Your session has ended. Please sign in again.', { type: 'info' });
+        }
+        setUser(null);
+    }), []);
+
     const login = async (email, password) => {
         const res = await fetch(`${API_URL}/api/auth/login`, {
             method: 'POST',
@@ -47,7 +60,7 @@ export const AuthProvider = ({ children }) => {
             body: JSON.stringify({ email, password }),
             credentials: 'include'
         });
-        const data = await res.json();
+        const data = await readJson(res);
         if (data.success) {
             if (data.token) {
                 setAuthToken(data.token);
@@ -55,7 +68,7 @@ export const AuthProvider = ({ children }) => {
             setUser(data.user);
             return true;
         }
-        throw new Error(data.error || 'Login failed');
+        throw new Error(errorMessage(data, 'Login failed'));
     };
 
     const sendSignupOtp = async (email, username) => {
@@ -65,11 +78,11 @@ export const AuthProvider = ({ children }) => {
             body: JSON.stringify({ email, username }),
             credentials: 'include'
         });
-        const data = await res.json();
+        const data = await readJson(res);
         if (data.success) {
             return true;
         }
-        throw new Error(data.error || 'Failed to send verification code');
+        throw new Error(errorMessage(data, 'Failed to send verification code'));
     };
 
     const register = async (username, email, password, otp) => {
@@ -79,7 +92,7 @@ export const AuthProvider = ({ children }) => {
             body: JSON.stringify({ username, email, password, otp }),
             credentials: 'include'
         });
-        const data = await res.json();
+        const data = await readJson(res);
         if (data.success) {
             if (data.token) {
                 setAuthToken(data.token);
@@ -87,7 +100,7 @@ export const AuthProvider = ({ children }) => {
             setUser(data.user);
             return true;
         }
-        throw new Error(data.error || 'Registration failed');
+        throw new Error(errorMessage(data, 'Registration failed'));
     };
 
     const sendEmailUpdateOtp = async (newEmail) => {
@@ -100,11 +113,11 @@ export const AuthProvider = ({ children }) => {
             body: JSON.stringify({ newEmail }),
             credentials: 'include'
         });
-        const data = await res.json();
+        const data = await readJson(res);
         if (data.success) {
             return true;
         }
-        throw new Error(data.error || 'Failed to send verification code');
+        throw new Error(errorMessage(data, 'Failed to send verification code'));
     };
 
     const sendForgotPasswordOtp = async (email) => {
@@ -114,11 +127,11 @@ export const AuthProvider = ({ children }) => {
             body: JSON.stringify({ email }),
             credentials: 'include'
         });
-        const data = await res.json();
+        const data = await readJson(res);
         if (data.success) {
             return true;
         }
-        throw new Error(data.error || 'Failed to send password reset code');
+        throw new Error(errorMessage(data, 'Failed to send password reset code'));
     };
 
     const resetPassword = async (email, otp, newPassword) => {
@@ -128,7 +141,7 @@ export const AuthProvider = ({ children }) => {
             body: JSON.stringify({ email, otp, newPassword }),
             credentials: 'include'
         });
-        const data = await res.json();
+        const data = await readJson(res);
         if (data.success) {
             if (data.token) {
                 setAuthToken(data.token);
@@ -136,7 +149,7 @@ export const AuthProvider = ({ children }) => {
             setUser(data.user);
             return true;
         }
-        throw new Error(data.error || 'Failed to reset password');
+        throw new Error(errorMessage(data, 'Failed to reset password'));
     };
 
     const logout = async () => {

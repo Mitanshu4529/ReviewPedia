@@ -4,7 +4,7 @@ import React, { useState, useRef, useEffect } from 'react';
 import { getJsonAuthHeaders } from '../utils/apiUtils';
 import { API_BASE_URL } from '../config';
 import { useAuth } from '../context/AuthContext';
-import { Sparkles, X, Play, Loader2, Mail, Bot, CheckCircle } from 'lucide-react';
+import { Sparkles, X, Loader2, Mail, Bot} from 'lucide-react';
 import '../index.css';
 
 export default function AgentBox({ demoEmail, isOpen, onClose }) {

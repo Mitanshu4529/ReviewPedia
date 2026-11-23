@@ -64,6 +64,7 @@ const { default: Comment } = await import('../models/Comment.js');
 const { default: Conversation } = await import('../models/Conversation.js');
 const { default: Message } = await import('../models/Message.js');
 const { default: EmailOtp } = await import('../models/EmailOtp.js');
+const { default: ChatUpload } = await import('../models/ChatUpload.js');
 const { isAllowedOrigin, validateUsername } = await import('../utils/security.js');
 const { assertPublicUrl, isBlockedAddress, fetchUrlMetadata, requestPinned, pinnedLookup } = await import('../utils/metadataFetcher.js');
 const { MAX_MEDIA_LIMIT } = await import('../middlewares/uploadMiddleware.js');
@@ -110,7 +111,7 @@ afterAll(async () => {
 
 beforeEach(async (ctx) => {
     if (!dbAvailable) return;
-    await Promise.all([User, Review, Comment, Conversation, Message, EmailOtp].map(m => m.deleteMany({})));
+    await Promise.all([User, Review, Comment, Conversation, Message, EmailOtp, ChatUpload].map(m => m.deleteMany({})));
     uploadStub.uploads.length = 0;
     uploadStub.destroyed.length = 0;
     [alice, bob, admin] = await User.create([
@@ -486,20 +487,18 @@ describe('Chat authorization', () => {
         expect((await Conversation.findById(convo._id)).lastMessage).toBe('hi alice');
     });
 
-    it('rejects empty messages, foreign media URLs and negative media sizes', async (ctx) => {
+    it('rejects empty messages, foreign media URLs and media the sender never uploaded', async (ctx) => {
         needsDb(ctx);
         const send = (body) => request(app).post('/api/chat/messages').set(auth(bob)).send({ conversationId: convo._id.toString(), ...body });
         expect((await send({})).status).toBe(400);
         expect((await send({ text: 'x'.repeat(5001) })).status).toBe(400);
         expect((await send({ mediaUrl: 'https://res.cloudinary.com/someone-else/image/upload/a.jpg', mediaType: 'image', mediaSize: 10 })).status).toBe(400);
-        const ownUrl = 'https://res.cloudinary.com/test-cloud/image/upload/v1/reviewpedia_chat/a.jpg';
-        expect((await send({ mediaUrl: ownUrl, mediaType: 'image', mediaSize: -5000000 })).status).toBe(400);
-        expect((await send({ mediaUrl: ownUrl, mediaType: 'script', mediaSize: 10 })).status).toBe(400);
+        // A file in our own account, but not one bob uploaded (e.g. someone's review image).
+        const victimUrl = 'https://res.cloudinary.com/test-cloud/image/upload/v1/reviewpedia/victim.jpg';
+        expect((await send({ mediaUrl: victimUrl, mediaType: 'image', mediaSize: 0 })).status).toBe(400);
+        expect((await send({ mediaUrl: victimUrl, mediaType: 'script' })).status).toBe(400);
         expect((await User.findById(bob._id)).totalMediaBytes).toBe(0);
-
-        const ok = await send({ mediaUrl: ownUrl, mediaType: 'image', mediaSize: 2048 });
-        expect(ok.status).toBe(200);
-        expect((await User.findById(bob._id)).totalMediaBytes).toBe(2048);
+        expect(await Message.countDocuments({ conversationId: convo._id })).toBe(1);
     });
 
     it('invalid conversation ids return 400; conversations list only shows own', async (ctx) => {
@@ -1092,18 +1091,81 @@ describe('Uploads (Cloudinary stubbed)', () => {
         expect(uploadStub.uploads[0].folder).toBe('reviewpedia_chat');
     });
 
-    it('chat message: the quota is enforced atomically when media is attached', async (ctx) => {
+    it('chat upload: the quota is charged atomically at upload time', async (ctx) => {
         needsDb(ctx);
-        const convo = await Conversation.create({ participants: [alice._id, bob._id], lastMessage: 'x' });
         await User.findByIdAndUpdate(bob._id, { totalMediaBytes: MAX_MEDIA_LIMIT - 5000 });
-        const url = 'https://res.cloudinary.com/test-cloud/image/upload/v1/reviewpedia_chat/a.png';
-        const send = () => request(app).post('/api/chat/messages').set(auth(bob))
-            .send({ conversationId: convo._id.toString(), mediaUrl: url, mediaType: 'image', mediaSize: 4000 });
-        const results = await Promise.all([send(), send(), send()]);
+        const up = () => request(app).post('/api/chat/upload').set(auth(bob))
+            .attach('file', png(4000), { filename: 'c.png', contentType: 'image/png' });
+        const results = await Promise.all([up(), up(), up()]);
         expect(results.filter(r => r.status === 200)).toHaveLength(1);
         expect(results.filter(r => r.status === 400)).toHaveLength(2);
         expect((await User.findById(bob._id)).totalMediaBytes).toBe(MAX_MEDIA_LIMIT - 1000);
-        expect(await Message.countDocuments({ conversationId: convo._id })).toBe(1);
+        // The two refused files were removed again.
+        expect(uploadStub.destroyed).toHaveLength(2);
+    });
+
+    it('chat media: only your own unsent upload can be attached, once, with its real size', async (ctx) => {
+        needsDb(ctx);
+        const convo = await Conversation.create({ participants: [alice._id, bob._id], lastMessage: 'x' });
+        const uploaded = await request(app).post('/api/chat/upload').set(auth(bob))
+            .attach('file', png(3000), { filename: 'c.png', contentType: 'image/png' });
+        expect(uploaded.status).toBe(200);
+        expect((await User.findById(bob._id)).totalMediaBytes).toBe(3000);
+        const mediaUrl = uploaded.body.mediaUrl;
+        const send = (user, extra = {}) => request(app).post('/api/chat/messages').set(auth(user))
+            .send({ conversationId: convo._id.toString(), mediaUrl, ...extra });
+
+        // Alice cannot attach bob's file.
+        expect((await send(alice, { mediaType: 'image' })).status).toBe(400);
+        // Bob can; the client-claimed size is ignored.
+        const ok = await send(bob, { mediaType: 'image', mediaSize: 1 });
+        expect(ok.status).toBe(200);
+        expect(ok.body.message.mediaSize).toBe(3000);
+        expect((await User.findById(bob._id)).totalMediaBytes).toBe(3000);
+        // The same upload cannot be attached a second time.
+        expect((await send(bob, { mediaType: 'image' })).status).toBe(400);
+
+        // Deleting the message removes exactly that file and frees its bytes.
+        uploadStub.destroyed.length = 0;
+        expect((await request(app).delete(`/api/chat/messages/${ok.body.message._id}`).set(auth(bob))).status).toBe(200);
+        expect(uploadStub.destroyed).toEqual([uploadStub.uploads[0].id]);
+        expect((await User.findById(bob._id)).totalMediaBytes).toBe(0);
+    });
+
+    it('chat delete never removes files outside the chat folder (old messages)', async (ctx) => {
+        needsDb(ctx);
+        const convo = await Conversation.create({ participants: [alice._id, bob._id], lastMessage: 'x' });
+        // A message stored before uploads were recorded, pointing at a review image.
+        await Message.create({
+            conversationId: convo._id, sender: bob._id, mediaType: 'image', mediaSize: 0,
+            mediaUrl: 'https://res.cloudinary.com/test-cloud/image/upload/v1/reviewpedia/victim.jpg'
+        });
+        expect((await request(app).delete(`/api/chat/conversations/${convo._id}`).set(auth(bob))).status).toBe(200);
+        expect(uploadStub.destroyed).toHaveLength(0);
+    });
+
+    it('review edit: an item left out of mediaOrder is removed and credited, extra uploads are discarded', async (ctx) => {
+        needsDb(ctx);
+        const keep = 'https://res.cloudinary.com/test-cloud/image/upload/v1/reviewpedia/keep.png';
+        const drop = 'https://res.cloudinary.com/test-cloud/image/upload/v1/reviewpedia/drop.png';
+        const review = await Review.create(reviewDoc({
+            user: { id: alice._id, name: 'alice' },
+            review: { title: 't', text: 'x', rating: 4, media: [{ type: 'image', url: keep, size: 1000 }, { type: 'image', url: drop, size: 2000 }] }
+        }));
+        await User.findByIdAndUpdate(alice._id, { totalMediaBytes: 3000 });
+        const res = await request(app).put(`/api/reviews/${review._id}`).set(auth(alice))
+            .field('data', JSON.stringify({
+                review: { text: 'x' },
+                existingMedia: [{ url: keep }, { url: drop }],
+                mediaOrder: [{ type: 'existing', url: keep }, { type: 'new' }]
+            }))
+            .attach('images', png(500), { filename: 'a.png', contentType: 'image/png' })
+            .attach('images', png(700), { filename: 'b.png', contentType: 'image/png' });
+        expect(res.status).toBe(200);
+        expect(res.body.review.media.map(m => m.url)).toEqual([keep, expect.stringContaining('reviewpedia/stub-1')]);
+        // drop.png (left out of mediaOrder) and the unreferenced second upload are deleted.
+        expect([...uploadStub.destroyed].sort()).toEqual(['reviewpedia/drop', 'reviewpedia/stub-2']);
+        expect((await User.findById(alice._id)).totalMediaBytes).toBe(1500);
     });
 
     it('avatar: images only, 2 MB, and the picture cannot be set from a text field', async (ctx) => {
@@ -1307,5 +1369,64 @@ describe('Link preview: the validated address is the one connected to', () => {
         } finally {
             await new Promise(resolve => server.close(resolve));
         }
+    });
+});
+
+describe('Cross-site requests and sessions', () => {
+    it('state-changing requests from a foreign Origin are refused; our own origin is allowed', async (ctx) => {
+        needsDb(ctx);
+        const evil = await request(app).post('/api/auth/logout').set('Origin', 'https://evil.example');
+        expect(evil.status).toBe(403);
+        const nullOrigin = await request(app).post('/api/auth/logout').set('Origin', 'null');
+        expect(nullOrigin.status).toBe(403);
+        const ours = await request(app).post('/api/auth/logout').set('Origin', 'http://localhost:5173');
+        expect(ours.status).toBe(200);
+        // Reads are unaffected.
+        expect((await request(app).get('/api/health').set('Origin', 'https://evil.example')).status).toBe(200);
+    });
+
+    it('a password reset ends sessions issued before it', async (ctx) => {
+        needsDb(ctx);
+        const login = await request(app).post('/api/auth/login').send({ email: 'alice@example.com', password: 'password1' });
+        expect(login.status).toBe(200);
+        const oldToken = login.body.token;
+        expect((await request(app).get('/api/auth/me').set('Authorization', `Bearer ${oldToken}`)).status).toBe(200);
+
+        await EmailOtp.create({ email: 'alice@example.com', purpose: 'forgot_password', otp: '123456' });
+        const reset = await request(app).post('/api/auth/reset-password')
+            .send({ email: 'alice@example.com', otp: '123456', newPassword: 'brand-new-pass' });
+        expect(reset.status).toBe(200);
+
+        expect((await request(app).get('/api/auth/me').set('Authorization', `Bearer ${oldToken}`)).status).toBe(401);
+        expect((await request(app).get('/api/auth/me').set('Authorization', `Bearer ${reset.body.token}`)).status).toBe(200);
+    });
+
+    it('auth endpoints answer 400, not 500, for non-string input', async (ctx) => {
+        needsDb(ctx);
+        expect((await request(app).post('/api/auth/send-signup-otp').send({ email: ['a@b.c'], username: 'zed' })).status).toBe(400);
+        expect((await request(app).post('/api/auth/send-forgot-password-otp').send({ email: { $ne: '' } })).status).toBe(400);
+        expect((await request(app).post('/api/auth/reset-password')
+            .send({ email: 'alice@example.com', otp: '123456', newPassword: ['a', 'b', 'c', 'd', 'e', 'f'] })).status).toBe(400);
+    });
+
+    it('purchase links must be web addresses', async (ctx) => {
+        needsDb(ctx);
+        const review = await Review.create(reviewDoc({ user: { id: alice._id, name: 'alice' } }));
+        const patch = (body) => request(app).patch(`/api/reviews/${review._id}/purchase-info`).set(auth(alice)).send(body);
+        expect((await patch({ purchaseLink: 'javascript:alert(1)' })).status).toBe(400);
+        expect((await patch({ purchaseLink: 'x'.repeat(3000) })).status).toBe(400);
+        const ok = await patch({ purchaseLink: 'https://shop.example/item', purchaseMeta: { title: 'Item', image: 'javascript:x' } });
+        expect(ok.status).toBe(200);
+        expect(ok.body.product.purchaseLink).toBe('https://shop.example/item');
+        expect(ok.body.product.purchaseMeta.image).toBe('');
+    });
+
+    it('two simultaneous "start chat" requests create one conversation', async (ctx) => {
+        needsDb(ctx);
+        await Conversation.syncIndexes();
+        const start = () => request(app).post('/api/chat/conversations').set(auth(alice)).send({ targetUsername: 'bob' });
+        const results = await Promise.all([start(), start(), start()]);
+        expect(results.every(r => r.status === 200)).toBe(true);
+        expect(await Conversation.countDocuments()).toBe(1);
     });
 });

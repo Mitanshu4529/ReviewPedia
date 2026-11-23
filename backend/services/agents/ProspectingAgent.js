@@ -7,6 +7,7 @@ import { escapeRegex } from '../../utils/security.js';
 
 const MAX_BRANDS_PER_RUN = 5;       // each brand is a separate paid model conversation
 const MAX_TOOL_ROUNDS = 6;          // upper bound on tool-call round trips per brand
+const ALLOWED_TOOLS = new Set(toolsDeclarations.prospecting.map(t => t.name));
 
 export async function runProspectingAgent(demoEmail) {
     const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
@@ -86,7 +87,8 @@ Rules:
                     try {
                         console.log(`[Agent Tool Call] ${call.name}`);
                         
-                        if (!Object.prototype.hasOwnProperty.call(toolsMap, call.name)) {
+                        // Only this agent's own tools may run.
+                        if (!ALLOWED_TOOLS.has(call.name)) {
                             throw new Error(`Unknown tool: ${call.name}`);
                         }
                         if (call.name === 'send_outreach_email') {
@@ -95,7 +97,7 @@ Rules:
                             if (!demoEmail) {
                                 throw new Error('No approved recipient configured; email was not sent.');
                             }
-                            call.args.to_email = demoEmail;
+                            call.args = { ...(call.args || {}), to_email: demoEmail };
                         }
 
                         const rawResult = await toolsMap[call.name](call.args);

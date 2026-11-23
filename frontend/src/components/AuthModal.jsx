@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { X, Mail, Lock, User, LogIn, KeyRound, ArrowLeft, RefreshCw, CheckCircle2, Eye, EyeOff } from 'lucide-react';
+import { X, Mail, Lock, User, LogIn, KeyRound, ArrowLeft, CheckCircle2, Eye, EyeOff } from 'lucide-react';
 import { useAuth } from '../context/AuthContext';
 import { useModalA11y } from '../utils/a11y';
 import '../index.css';

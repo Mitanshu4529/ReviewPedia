@@ -3,7 +3,7 @@ import User from '../models/User.js';
 import Comment from '../models/Comment.js';
 import mongoose from 'mongoose';
 import { latLngToCell, cellToBoundary, isValidCell, getResolution } from 'h3-js';
-import { cloudinaryInstance, MAX_MEDIA_LIMIT, STORAGE_LIMIT_MESSAGE } from '../middlewares/uploadMiddleware.js';
+import { cloudinaryInstance, MAX_MEDIA_LIMIT, STORAGE_LIMIT_MESSAGE, reserveMediaBytes, releaseMediaBytes } from '../middlewares/uploadMiddleware.js';
 import { fetchUrlMetadata } from '../utils/metadataFetcher.js';
 import { isValidObjectId, httpError } from '../utils/security.js';
 
@@ -36,6 +36,54 @@ const parseBody = (req) => {
 };
 
 const cleanString = (value, max) => (typeof value === 'string' ? value.trim().slice(0, max) : '');
+
+// Purchase links are shown as clickable links, so only web addresses are kept.
+// A link typed without a scheme ("amazon.in/...") is allowed; any other scheme
+// (javascript:, data:, ...) is refused.
+const MAX_LINK_LENGTH = 2048;
+const cleanWebLink = (value) => {
+    if (typeof value !== 'string') return null;
+    const link = value.trim();
+    if (!link) return '';
+    if (link.length > MAX_LINK_LENGTH) return null;
+    if (/^[a-z][a-z0-9+.-]*:/i.test(link) && !/^https?:\/\//i.test(link)) return null;
+    return link;
+};
+const META_FIELDS = { title: 300, description: 1000, image: MAX_LINK_LENGTH, siteName: 200, url: MAX_LINK_LENGTH };
+const EMPTY_META = { title: '', description: '', image: '', siteName: '', url: '' };
+
+/**
+ * Validates the purchase fields of a request. Returns { error } or an object
+ * holding only the fields that were sent, cleaned.
+ */
+const parsePurchaseFields = ({ purchaseLink, purchaseType, purchaseMeta } = {}) => {
+    const out = {};
+    if (purchaseLink !== undefined) {
+        const link = cleanWebLink(purchaseLink);
+        if (link === null) return { error: 'Purchase link must be a web address (http or https)' };
+        out.purchaseLink = link;
+    }
+    if (purchaseType !== undefined && purchaseType !== null && purchaseType !== '') {
+        if (typeof purchaseType !== 'string') return { error: 'Invalid purchase type' };
+        out.purchaseType = purchaseType.trim().slice(0, 30);
+    }
+    if (purchaseMeta !== undefined) {
+        if (purchaseMeta === null || purchaseMeta === '') {
+            out.purchaseMeta = { ...EMPTY_META };
+        } else if (typeof purchaseMeta !== 'object' || Array.isArray(purchaseMeta)) {
+            return { error: 'Invalid purchase details' };
+        } else {
+            const meta = {};
+            for (const [field, max] of Object.entries(META_FIELDS)) {
+                meta[field] = cleanString(purchaseMeta[field], max);
+            }
+            meta.image = cleanWebLink(meta.image) ?? '';
+            meta.url = cleanWebLink(meta.url) ?? '';
+            out.purchaseMeta = meta;
+        }
+    }
+    return out;
+};
 
 // Ratings are whole or half stars from 0.5 to 5.
 const parseRating = (value) => {
@@ -465,13 +513,9 @@ export const deleteReview = async (req, res, next) => {
             }
         }
 
-        if (bytesToSubtract > 0) {
+        if (bytesToSubtract > 0 && review.user?.id) {
             // Credit the storage back to the review's author (an admin may be the one deleting).
-            const userDoc = review.user?.id ? await User.findById(review.user.id) : null;
-            if (userDoc) {
-                const newTotal = Math.max(0, (userDoc.totalMediaBytes || 0) - bytesToSubtract);
-                await User.findByIdAndUpdate(userDoc._id, { totalMediaBytes: newTotal });
-            }
+            await releaseMediaBytes(review.user.id, bytesToSubtract);
         }
 
         await Comment.deleteMany({ reviewId: review._id });
@@ -519,6 +563,11 @@ export const updateReview = async (req, res, next) => {
             await discardUploads(req.files);
             return res.status(400).json({ error: `Review text is too long (max ${MAX_REVIEW_TEXT} characters)` });
         }
+        const purchase = parsePurchaseFields(bodyData.product || {});
+        if (purchase.error) {
+            await discardUploads(req.files);
+            return res.status(400).json({ error: purchase.error });
+        }
 
         // Media is only rewritten when the request carries a `review` object (see
         // below). Without one, uploads have nowhere to go and nothing is removed.
@@ -528,72 +577,67 @@ export const updateReview = async (req, res, next) => {
             await discardUploads(files);
             files = [];
         }
-        let totalNewSize = 0;
-        for (const file of files) {
-            totalNewSize += (file.size || file.bytes || 0);
-        }
+        const toMediaItem = (file) => {
+            const isVideo = file.mimetype?.startsWith('video/') || /\.(mp4|mov|avi|webm)$/i.test(file.path || '');
+            return { type: isVideo ? 'video' : 'image', url: file.path, size: file.size || file.bytes || 0 };
+        };
 
-        // Old media the edit drops. It is deleted from Cloudinary only after the
-        // edit has been saved: deleting first left the review pointing at files
-        // that no longer existed whenever the edit was then rejected.
+        // Build the final media list first; everything else follows from it.
+        let updatedMediaArray = [];
+        let usedFiles = files;
+        if (Array.isArray(bodyData.mediaOrder)) {
+            usedFiles = [];
+            const seenUrls = new Set();
+            let newFileIdx = 0;
+            for (const item of bodyData.mediaOrder) {
+                if (item?.type === 'existing') {
+                    const found = existingMedia.find(m => m.url === item.url);
+                    if (found && !seenUrls.has(found.url)) {
+                        seenUrls.add(found.url);
+                        updatedMediaArray.push(found);
+                    }
+                } else if (item?.type === 'new' && newFileIdx < files.length) {
+                    const file = files[newFileIdx++];
+                    usedFiles.push(file);
+                    updatedMediaArray.push(toMediaItem(file));
+                }
+            }
+        } else {
+            updatedMediaArray = [...existingMedia, ...files.map(toMediaItem)];
+        }
+        // Uploads the final list does not reference are deleted now, not left orphaned.
+        const unusedFiles = files.filter(f => !usedFiles.includes(f));
+        if (unusedFiles.length > 0) await discardUploads(unusedFiles);
+        files = usedFiles;
+
+        const totalNewSize = files.reduce((sum, f) => sum + (f.size || f.bytes || 0), 0);
+
+        // Old media the edit drops, judged against the final list (so an item the
+        // client kept but left out of mediaOrder is removed and credited too). It is
+        // deleted from Cloudinary only after the edit has been saved: deleting first
+        // left the review pointing at missing files whenever the save then failed.
         const oldMedia = review.review?.media || [];
-        const keptUrls = new Set(existingMedia.map(m => m.url));
-        const removedMedia = mediaIsRewritten ? oldMedia.filter(oldM => !keptUrls.has(oldM.url)) : [];
+        const finalUrls = new Set(updatedMediaArray.map(m => m.url));
+        const removedMedia = mediaIsRewritten ? oldMedia.filter(oldM => !finalUrls.has(oldM.url)) : [];
         const removedOldSize = removedMedia.reduce((sum, m) => sum + (m.size || 0), 0);
 
         const diff = totalNewSize - removedOldSize;
         // Storage is accounted against the review's author.
-        const userDoc = review.user?.id ? await User.findById(review.user.id) : null;
+        const authorId = review.user?.id || null;
 
-        if (userDoc && diff > 0) {
-            // Conditional $inc: check and update in one atomic step.
-            const reserved = await User.findOneAndUpdate(
-                { _id: userDoc._id, $expr: { $lte: [{ $add: [{ $ifNull: ['$totalMediaBytes', 0] }, diff] }, MAX_MEDIA_LIMIT] } },
-                { $inc: { totalMediaBytes: diff } }
-            );
-            if (!reserved) {
+        if (authorId && diff > 0) {
+            if (!(await reserveMediaBytes(authorId, diff))) {
                 await discardUploads(files);
                 return res.status(400).json({ error: STORAGE_LIMIT_MESSAGE });
             }
-        } else if (userDoc && diff < 0) {
-            const newTotal = Math.max(0, (userDoc.totalMediaBytes || 0) + diff);
-            await User.findByIdAndUpdate(userDoc._id, { totalMediaBytes: newTotal });
-        }
-
-        let updatedMediaArray = [];
-        if (bodyData.mediaOrder && Array.isArray(bodyData.mediaOrder)) {
-            const newUploadedMedia = [];
-            for (const file of files) {
-                const fileSize = file.size || file.bytes || 0;
-                const isVideo = file.mimetype?.startsWith('video/') || file.path?.match(/\.(mp4|mov|avi|webm)$/i);
-                newUploadedMedia.push({ type: isVideo ? 'video' : 'image', url: file.path, size: fileSize });
-            }
-            let newFileIdx = 0;
-            for (const item of bodyData.mediaOrder) {
-                if (item.type === 'existing') {
-                    const found = existingMedia.find(m => m.url === item.url);
-                    if (found) updatedMediaArray.push(found);
-                } else if (item.type === 'new') {
-                    if (newFileIdx < newUploadedMedia.length) {
-                        updatedMediaArray.push(newUploadedMedia[newFileIdx++]);
-                    }
-                }
-            }
-        } else {
-            updatedMediaArray = [...existingMedia];
-            for (const file of files) {
-                const fileSize = file.size || file.bytes || 0;
-                const isVideo = file.mimetype?.startsWith('video/') || file.path?.match(/\.(mp4|mov|avi|webm)$/i);
-                updatedMediaArray.push({ type: isVideo ? 'video' : 'image', url: file.path, size: fileSize });
-            }
+        } else if (authorId && diff < 0) {
+            await releaseMediaBytes(authorId, -diff);
         }
 
         if (cleanString(bodyData.product?.name, MAX_SHORT_FIELD)) review.product.name = cleanString(bodyData.product.name, MAX_SHORT_FIELD);
         if (bodyData.product?.brand !== undefined) review.product.brand = cleanString(bodyData.product.brand, MAX_SHORT_FIELD);
         if (cleanString(bodyData.product?.category, MAX_SHORT_FIELD)) review.product.category = cleanString(bodyData.product.category, MAX_SHORT_FIELD);
-        if (bodyData.product?.purchaseLink !== undefined) review.product.purchaseLink = bodyData.product.purchaseLink;
-        if (bodyData.product?.purchaseType !== undefined) review.product.purchaseType = bodyData.product.purchaseType;
-        if (bodyData.product?.purchaseMeta !== undefined) review.product.purchaseMeta = bodyData.product.purchaseMeta;
+        Object.assign(review.product, purchase);
 
         if (bodyData.review) {
             if (typeof bodyData.review.text === 'string') {
@@ -611,9 +655,8 @@ export const updateReview = async (req, res, next) => {
             await review.save();
         } catch (saveErr) {
             // Undo the storage accounting and drop the new uploads; the old media is untouched.
-            if (userDoc && diff !== 0) {
-                await User.findByIdAndUpdate(userDoc._id, { $inc: { totalMediaBytes: -diff } });
-            }
+            if (authorId && diff > 0) await releaseMediaBytes(authorId, diff);
+            if (authorId && diff < 0) await User.updateOne({ _id: authorId }, { $inc: { totalMediaBytes: -diff } });
             await discardUploads(files);
             throw saveErr;
         }
@@ -916,19 +959,13 @@ export const updatePurchaseInfo = async (req, res, next) => {
             return res.status(403).json({ error: 'You are not authorized to update this review' });
         }
 
-        const { purchaseLink, purchaseType, purchaseMeta } = req.body;
-        if (!review.product) review.product = {};
-        review.product.purchaseLink = purchaseLink !== undefined ? purchaseLink : review.product.purchaseLink;
-        review.product.purchaseType = purchaseType || review.product.purchaseType || 'online';
-        if (purchaseMeta !== undefined) {
-            review.product.purchaseMeta = purchaseMeta || {
-                title: '',
-                description: '',
-                image: '',
-                siteName: '',
-                url: ''
-            };
+        const purchase = parsePurchaseFields(req.body || {});
+        if (purchase.error) {
+            return res.status(400).json({ error: purchase.error });
         }
+        if (!review.product) review.product = {};
+        Object.assign(review.product, purchase);
+        if (!review.product.purchaseType) review.product.purchaseType = 'online';
 
         await review.save();
 

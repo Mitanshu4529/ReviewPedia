@@ -9,7 +9,7 @@ import agentRoutes from './routes/agentRoutes.js';
 import authRoutes from './routes/authRoutes.js';
 import chatRoutes from './routes/chatRoutes.js';
 import { errorHandler } from './middlewares/errorHandler.js';
-import { corsOriginCallback } from './utils/security.js';
+import { corsOriginCallback, isAllowedOrigin } from './utils/security.js';
 import cookieParser from 'cookie-parser';
 
 const app = express();
@@ -62,6 +62,19 @@ app.use(cors({
     allowedHeaders: ['Content-Type', 'Authorization', 'Accept', 'Origin', 'X-Requested-With'],
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS']
 }));
+// CSRF guard. The session cookie is SameSite=None in production, so a page on
+// another site could otherwise submit a form (a "simple" request that CORS does
+// not block) and act as the signed-in visitor. Browsers always send Origin on
+// cross-site POST/PUT/PATCH/DELETE, so those are refused unless the origin is
+// one of ours. Requests without Origin (curl, server-to-server) are unaffected.
+const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
+app.use('/api', (req, res, next) => {
+    if (SAFE_METHODS.has(req.method)) return next();
+    // isAllowedOrigin: no Origin → allowed; the opaque origin "null" → refused.
+    if (isAllowedOrigin(req.headers.origin)) return next();
+    return res.status(403).json({ success: false, error: { message: 'Cross-site request refused' } });
+});
+
 app.use(express.json({ limit: '200kb' }));
 app.use(cookieParser());
 

@@ -69,6 +69,9 @@ const consumeOtp = async (email, purpose, code) => {
     return claimed.deletedCount === 1 ? null : 'missing';
 };
 
+/** A string that looks like an email address (the real check is the code sent to it). */
+const isEmailString = (value) => typeof value === 'string' && value.length <= 254 && value.includes('@');
+
 const isProduction = process.env.NODE_ENV === 'production' || !!process.env.RENDER;
 
 const getCookieOptions = () => ({
@@ -82,10 +85,7 @@ const getCookieOptions = () => ({
 export const sendSignupOtp = async (req, res) => {
     try {
         const { email, username } = req.body;
-        if (!email || !email.includes('@')) {
-            return res.status(400).json({ success: false, error: 'A valid email address is required' });
-        }
-        if (typeof email !== 'string') {
+        if (!isEmailString(email)) {
             return res.status(400).json({ success: false, error: 'A valid email address is required' });
         }
         const cleanUsername = typeof username === 'string' ? username.trim() : username;
@@ -127,7 +127,7 @@ export const sendSignupOtp = async (req, res) => {
         });
     } catch (error) {
         console.error('Error in sendSignupOtp:', error);
-        res.status(500).json({ success: false, error: error.message || 'Failed to send verification code' });
+        res.status(500).json({ success: false, error: 'Failed to send verification code. Please try again later.' });
     }
 };
 
@@ -135,7 +135,7 @@ export const sendSignupOtp = async (req, res) => {
 export const sendEmailUpdateOtp = async (req, res) => {
     try {
         const { newEmail } = req.body;
-        if (!newEmail || !newEmail.includes('@')) {
+        if (!isEmailString(newEmail)) {
             return res.status(400).json({ success: false, error: 'A valid new email address is required' });
         }
 
@@ -174,14 +174,14 @@ export const sendEmailUpdateOtp = async (req, res) => {
         });
     } catch (error) {
         console.error('Error in sendEmailUpdateOtp:', error);
-        res.status(500).json({ success: false, error: error.message || 'Failed to send verification code' });
+        res.status(500).json({ success: false, error: 'Failed to send verification code. Please try again later.' });
     }
 };
 
 export const register = async (req, res) => {
     try {
         const { username, email, password, otp } = req.body;
-        if (!otp) {
+        if (typeof otp !== 'string' && typeof otp !== 'number') {
             return res.status(400).json({ success: false, error: 'Email verification code is required' });
         }
 
@@ -212,6 +212,11 @@ export const register = async (req, res) => {
 
         res.status(201).json({ success: true, token, user });
     } catch (error) {
+        // A duplicate-key error means another sign-up took the email or username
+        // between the checks and the insert; its raw text names the index and value.
+        if (error?.code === 11000) {
+            return res.status(400).json({ success: false, error: 'That email or username is already registered' });
+        }
         res.status(400).json({ success: false, error: error.message });
     }
 };
@@ -351,7 +356,7 @@ export const getUserByUsername = async (req, res) => {
 export const deleteAccount = async (req, res) => {
     try {
         const { email } = req.body;
-        if (!email) {
+        if (typeof email !== 'string' || !email) {
             return res.status(400).json({ success: false, error: 'Email confirmation is required' });
         }
         await authService.deleteAccount(req.user.id, email);
@@ -370,20 +375,21 @@ export const deleteAccount = async (req, res) => {
 export const sendForgotPasswordOtp = async (req, res) => {
     try {
         const { email } = req.body;
-        if (!email || !email.includes('@')) {
+        if (!isEmailString(email)) {
             return res.status(400).json({ success: false, error: 'A valid email address is required' });
         }
 
         const cleanEmail = email.trim().toLowerCase();
+        const genericReply = {
+            success: true,
+            message: 'If an account exists for this email, a password reset code has been sent.'
+        };
 
         // Same answer whether or not the address is registered: a different
         // response for unknown emails lets anyone test which emails have accounts.
         const existingUser = await User.findOne({ email: cleanEmail });
         if (!existingUser) {
-            return res.status(200).json({
-                success: true,
-                message: 'If an account exists for this email, a password reset code has been sent.'
-            });
+            return res.status(200).json(genericReply);
         }
 
         const otp = generateOtp();
@@ -399,13 +405,10 @@ export const sendForgotPasswordOtp = async (req, res) => {
             username: existingUser.username
         });
 
-        res.status(200).json({
-            success: true,
-            message: `Password reset code sent to ${cleanEmail}`
-        });
+        res.status(200).json(genericReply);
     } catch (error) {
         console.error('Error in sendForgotPasswordOtp:', error);
-        res.status(500).json({ success: false, error: error.message || 'Failed to send password reset code' });
+        res.status(500).json({ success: false, error: 'Failed to send password reset code. Please try again later.' });
     }
 };
 
@@ -413,13 +416,13 @@ export const sendForgotPasswordOtp = async (req, res) => {
 export const resetPassword = async (req, res) => {
     try {
         const { email, otp, newPassword } = req.body;
-        if (!email || !email.includes('@')) {
+        if (!isEmailString(email)) {
             return res.status(400).json({ success: false, error: 'A valid email address is required' });
         }
-        if (!otp) {
+        if (typeof otp !== 'string' && typeof otp !== 'number') {
             return res.status(400).json({ success: false, error: 'Verification code is required' });
         }
-        if (!newPassword || newPassword.length < 6) {
+        if (typeof newPassword !== 'string' || newPassword.length < 6) {
             return res.status(400).json({ success: false, error: 'New password must be at least 6 characters long' });
         }
 

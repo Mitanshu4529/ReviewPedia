@@ -6,7 +6,7 @@ import LocationPickerModal from './LocationPickerModal';
 import MediaLightbox from './MediaLightbox';
 import ConfirmModal from './ConfirmModal';
 import LoadingPopup from './LoadingPopup';
-import { getAuthHeaders, getJsonAuthHeaders } from '../utils/apiUtils';
+import { getAuthHeaders, getJsonAuthHeaders, errorMessage, readJson } from '../utils/apiUtils';
 import { useChat } from '../context/ChatContext';
 import { notify } from '../utils/notify';
 
@@ -122,83 +122,67 @@ export default function ChatWindow({ conversation, currentUser, socket, onMessag
         if ((!text.trim() && files.length === 0) || isSending) return;
 
         setIsSending(true);
+        const API_URL = API_BASE_URL;
         try {
-            const API_URL = API_BASE_URL;
-            
-            // Send text message first if it exists
+            // Text first. It is cleared as soon as the server accepts it, so a
+            // failure while sending the files below never sends it a second time.
             if (text.trim()) {
-                const textPayload = {
-                    conversationId: conversation._id,
-                    receiverId: otherUser._id,
-                    text: text.trim(),
-                    mediaUrl: null,
-                    mediaType: 'none'
-                };
                 const textRes = await fetch(`${API_URL}/api/chat/messages`, {
                     method: 'POST',
                     headers: getJsonAuthHeaders(),
                     credentials: 'include',
-                    body: JSON.stringify(textPayload)
+                    body: JSON.stringify({ conversationId: conversation._id, text: text.trim() })
                 });
-                const textData = await textRes.json();
-                if (textData.success) {
-                    setMessages(prev => [...prev, textData.message]);
-                } else {
-                    throw new Error(textData.error?.message || "Failed to send text");
+                const textData = await readJson(textRes);
+                if (!textRes.ok || !textData.success) {
+                    throw new Error(errorMessage(textData, 'Failed to send message'));
                 }
+                setMessages(prev => [...prev, textData.message]);
+                setText('');
             }
 
-            // Send each file as a separate message
-            for (let i = 0; i < files.length; i++) {
-                const currentFile = files[i];
-                const formData = new FormData();
-                formData.append('file', currentFile);
-                
-                const uploadRes = await fetch(`${API_URL}/api/chat/upload`, {
-                    method: 'POST',
-                    headers: getAuthHeaders(),
-                    credentials: 'include',
-                    body: formData
-                });
-                const uploadData = await uploadRes.json();
-                
-                if (uploadData.success) {
-                    const mediaPayload = {
-                        conversationId: conversation._id,
-                        receiverId: otherUser._id,
-                        text: '',
-                        mediaUrl: uploadData.mediaUrl,
-                        mediaType: uploadData.mediaType,
-                        mediaSize: uploadData.mediaSize
-                    };
+            // Then each file as its own message. A file leaves the queue once it
+            // is sent; one that fails stays queued so the user can retry it.
+            const failed = [];
+            for (const currentFile of files) {
+                try {
+                    const formData = new FormData();
+                    formData.append('file', currentFile);
+                    const uploadRes = await fetch(`${API_URL}/api/chat/upload`, {
+                        method: 'POST',
+                        headers: getAuthHeaders(),
+                        credentials: 'include',
+                        body: formData
+                    });
+                    const uploadData = await readJson(uploadRes);
+                    if (!uploadRes.ok || !uploadData.success) {
+                        throw new Error(errorMessage(uploadData, uploadRes.status === 413 ? 'File is too large' : 'Failed to upload media'));
+                    }
                     const mediaRes = await fetch(`${API_URL}/api/chat/messages`, {
                         method: 'POST',
                         headers: getJsonAuthHeaders(),
                         credentials: 'include',
-                        body: JSON.stringify(mediaPayload)
+                        body: JSON.stringify({ conversationId: conversation._id, mediaUrl: uploadData.mediaUrl })
                     });
-                    const mediaData = await mediaRes.json();
-                    if (mediaData.success) {
-                        setMessages(prev => [...prev, mediaData.message]);
-                    } else {
-                        notify(mediaData.error?.message || "Failed to send media");
+                    const mediaData = await readJson(mediaRes);
+                    if (!mediaRes.ok || !mediaData.success) {
+                        throw new Error(errorMessage(mediaData, 'Failed to send media'));
                     }
-                } else {
-                    notify(uploadData.error?.message || "Failed to upload media");
+                    setMessages(prev => [...prev, mediaData.message]);
+                } catch (fileErr) {
+                    failed.push(currentFile);
+                    notify(`${currentFile.name}: ${fileErr.message}`);
                 }
             }
-
-            setText('');
-            setFiles([]);
-            if (fileInputRef.current) fileInputRef.current.value = '';
+            setFiles(failed);
+            if (failed.length === 0 && fileInputRef.current) fileInputRef.current.value = '';
             scrollToBottom();
-            if (onMessageSent) onMessageSent();
-
-        } catch (e) {
-            console.error("Failed to send message", e);
-            notify("Error sending message: " + e.message);
+        } catch (err) {
+            console.error("Failed to send message", err);
+            notify(err.message || 'Failed to send message');
         } finally {
             setIsSending(false);
+            if (onMessageSent) onMessageSent();
         }
     };
 

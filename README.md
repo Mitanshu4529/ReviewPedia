@@ -168,7 +168,7 @@ Reviewpedia/
 ├── frontend/
 │   ├── public/                   # Static assets & category graphics
 │   ├── src/
-│   │   ├── components/           # Map (Leaflet + H3), AgentBox, ReviewCard, ChatApp, AuthModal, etc.
+│   │   ├── components/           # Map (Leaflet + H3), AgentBox, MultiReviewCard, ChatApp, AuthModal, etc.
 │   │   ├── context/              # AuthContext & ChatContext providers
 │   │   ├── utils/                # Date formatting, URL helpers, category constants
 │   │   ├── App.jsx               # Application root & mode switching
@@ -176,9 +176,7 @@ Reviewpedia/
 │   ├── index.html                # Entry HTML with web fonts
 │   ├── vite.config.js            # Vite configuration with optimized vendor chunking
 │   └── .env.example              # Frontend environment variable template
-├── final_cleaned_reviews.csv     # Hyperlocal review dataset for initial seeding
-├── DESIGN.md                     # UI/UX design specifications
-└── INSTRUCTIONS.md               # Backend architecture guidelines
+└── final_cleaned_reviews.csv     # Hyperlocal review dataset for initial seeding
 ```
 
 ---
@@ -318,7 +316,7 @@ Reviewpedia's B2B layer IS the CRM. The geo-indexed review data IS the signal. T
 - [ ] Cross-platform rating aggregation (Amazon + Flipkart + brand website unified score)
 - [ ] Competitive intelligence agent (track competitor review spikes)
 - [ ] Voice-based review submission for low-literacy users
-- [ ] Full RAG-powered AI assistant (`AIAssistant.jsx` — partially built)
+- [ ] Full RAG-powered AI assistant
 - [ ] Mobile app (React Native)
 
 ---

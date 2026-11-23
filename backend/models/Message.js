@@ -28,6 +28,11 @@ const MessageSchema = new mongoose.Schema({
     type: Number,
     default: 0
   },
+  // Cloudinary public ID of the attached upload (set from the ChatUpload record).
+  mediaPublicId: {
+    type: String,
+    default: null
+  },
   location: {
     lat: Number,
     lng: Number,

@@ -33,6 +33,12 @@ const UserSchema = new mongoose.Schema({
   totalMediaBytes: {
     type: Number,
     default: 0
+  },
+  // Copied into every JWT as `tv`. Raising it (on a password reset) makes every
+  // token issued before that point invalid, so a stolen session ends.
+  tokenVersion: {
+    type: Number,
+    default: 0
   }
 }, { timestamps: true });
 

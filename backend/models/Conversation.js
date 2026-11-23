@@ -6,6 +6,13 @@ const ConversationSchema = new mongoose.Schema({
     ref: 'User',
     required: true
   }],
+  // Sorted "<idA>_<idB>" of the two participants. Unique, so two concurrent
+  // "start chat" requests cannot create two conversations for the same pair.
+  // Sparse because conversations created before this field existed lack it.
+  pairKey: {
+    type: String,
+    default: undefined
+  },
   lastMessage: {
     type: String,
     default: ""
@@ -16,9 +23,7 @@ const ConversationSchema = new mongoose.Schema({
   }
 }, { timestamps: true });
 
-// Ensure uniqueness of a conversation between participants (we don't want duplicates)
-// Actually, simple sorting before saving could help, but we'll manage uniqueness in controller.
-
+ConversationSchema.index({ pairKey: 1 }, { unique: true, sparse: true });
 ConversationSchema.index({ participants: 1 });
 ConversationSchema.index({ lastMessageAt: -1 });
 

@@ -72,7 +72,7 @@ export default function UserProfile({ username, userProfilePic, onClose, onChatC
             </div>
         </div>
 
-        {profile.status === 'ready' && (
+        {profile.status === 'ready' && onChatClick && (
           <div style={{ display: 'flex', gap: 10, marginBottom: '32px' }}>
               <button onClick={onChatClick} className="btn-primary" style={{ flex: 1, padding: '14px', fontSize: '1rem', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 10, cursor: 'pointer' }}>
                   <MessageCircle size={18} /> Chat with {username}

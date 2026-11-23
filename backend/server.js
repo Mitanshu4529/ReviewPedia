@@ -5,8 +5,9 @@ import jwt from 'jsonwebtoken';
 import app from './app.js';
 import { connectToDb } from './db/connect.js';
 import mongoose from 'mongoose';
+import User from './models/User.js';
 import { getJwtSecret } from './utils/jwtConfig.js';
-import { corsOriginCallback } from './utils/security.js';
+import { corsOriginCallback, isAllowedOrigin } from './utils/security.js';
 
 // Reads the JWT from the socket handshake: `auth.token` (sent by the client) or
 // the httpOnly `token` cookie.
@@ -30,6 +31,11 @@ const start = async () => {
         
         // Initialize Socket.io
         const io = new Server(server, {
+            // CORS only covers HTTP long-polling. A WebSocket upgrade is not subject
+            // to CORS, and it carries the session cookie, so its Origin is checked
+            // here: otherwise any website could open a socket as the visitor and
+            // read their private messages.
+            allowRequest: (req, callback) => callback(null, isAllowedOrigin(req.headers.origin)),
             cors: {
                 origin: corsOriginCallback,
                 methods: ['GET', 'POST'],
@@ -42,12 +48,20 @@ const start = async () => {
 
         // Every socket must present a valid JWT. Without this, anyone could join
         // another user's room and receive their private messages.
-        io.use((socket, next) => {
+        io.use(async (socket, next) => {
             const token = tokenFromHandshake(socket.handshake);
             if (!token) return next(new Error('Authentication required'));
             try {
                 const decoded = jwt.verify(token, getJwtSecret());
-                if (!decoded?.id) return next(new Error('Invalid token'));
+                if (!decoded?.id || !mongoose.Types.ObjectId.isValid(String(decoded.id))) {
+                    return next(new Error('Invalid token'));
+                }
+                // Same checks as requireAuth: the account must still exist and the
+                // token must not predate a password reset.
+                const account = await User.findById(decoded.id).select('tokenVersion').lean();
+                if (!account || (decoded.tv || 0) !== (account.tokenVersion || 0)) {
+                    return next(new Error('Invalid token'));
+                }
                 socket.data.userId = decoded.id.toString();
                 next();
             } catch {

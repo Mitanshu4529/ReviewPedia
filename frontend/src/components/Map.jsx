@@ -2,7 +2,7 @@ import React, { useEffect, useRef, useState, forwardRef, useImperativeHandle } f
 import { API_BASE_URL } from '../config';
 import L from 'leaflet';
 
-import { MapPin, Info, RefreshCw, Crosshair, X } from 'lucide-react';
+import { RefreshCw, X } from 'lucide-react';
 import LoadingPopup from './LoadingPopup';
 
 const getReliableUserLocation = (onSuccess, onError) => {
@@ -155,11 +155,17 @@ const AppMap = forwardRef(({ onReviewSelect, searchQuery, categoryQuery, mapUpda
       );
     }
 
+    // Destroy the map when the component goes away (e.g. on the way to /chat);
+    // only removing the listeners left a whole Leaflet instance behind each time,
+    // and under StrictMode the re-run then found a map without its listeners.
     return () => {
       if (mapInstance.current) {
-        mapInstance.current.off('zoomend');
-        mapInstance.current.off('moveend');
+        mapInstance.current.remove();
+        mapInstance.current = null;
       }
+      hexagonsLayer.current = null;
+      markersLayer.current = null;
+      userDotLayer.current = null;
     };
   }, []);
 
@@ -263,7 +269,11 @@ const AppMap = forwardRef(({ onReviewSelect, searchQuery, categoryQuery, mapUpda
     }
   };
 
+  // Only the summary for the most recently clicked hexagon may be shown.
+  const latestSummaryRequest = useRef(0);
   const fetchHexagonSummary = async (cellId) => {
+      const requestId = ++latestSummaryRequest.current;
+      const isCurrent = () => requestId === latestSummaryRequest.current;
       setHexLoading(true);
       setHexSummary(null);
       try {
@@ -280,13 +290,14 @@ const AppMap = forwardRef(({ onReviewSelect, searchQuery, categoryQuery, mapUpda
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({ reviews: hexReviews.map(r => ({ rating: r.review?.rating, text: r.review?.text || r.review?.title })) })
           });
-          const data = await res.json();
+          const data = await res.json().catch(() => ({}));
+          if (!isCurrent()) return;
           if (data.success) setHexSummary(data.result);
           else setHexSummary("Failed to generate AI summary.");
       } catch (err) {
-          setHexSummary("Network error generating summary.");
+          if (isCurrent()) setHexSummary("Network error generating summary.");
       } finally {
-          setHexLoading(false);
+          if (isCurrent()) setHexLoading(false);
       }
   };
 

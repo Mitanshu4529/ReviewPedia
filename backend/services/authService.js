@@ -5,7 +5,35 @@ import Message from '../models/Message.js';
 import Comment from '../models/Comment.js';
 import jwt from 'jsonwebtoken';
 import { getJwtSecret } from '../utils/jwtConfig.js';
-import { validateUsername } from '../utils/security.js';
+import ChatUpload from '../models/ChatUpload.js';
+import { validateUsername, isOwnCloudinaryUrl } from '../utils/security.js';
+import { cloudinaryInstance, releaseMediaBytes } from '../middlewares/uploadMiddleware.js';
+
+/** "<folder>/<file>" public ID of a file in this app's own Cloudinary account, else null. */
+const publicIdFromUrl = (url) => {
+    if (!isOwnCloudinaryUrl(url)) return null;
+    const parts = url.split('?')[0].split('/');
+    const filename = (parts.pop() || '').split('.')[0];
+    const folder = parts.pop();
+    return folder && filename ? `${folder}/${filename}` : null;
+};
+
+/**
+ * Signs a 7-day session token for `user`. `tv` is the account's tokenVersion;
+ * requireAuth refuses tokens whose version is older than the account's.
+ */
+export const issueSession = (user) => {
+    const publicUser = {
+        id: user._id,
+        username: user.username,
+        email: user.email,
+        role: user.role,
+        profilePic: user.profilePic,
+        totalMediaBytes: user.totalMediaBytes || 0
+    };
+    const token = jwt.sign({ ...publicUser, tv: user.tokenVersion || 0 }, getJwtSecret(), { expiresIn: '7d' });
+    return { token, user: publicUser };
+};
 
 // Usernames are unique ignoring case, so "Alice" cannot be registered next to "alice".
 const CASE_INSENSITIVE = { locale: 'en', strength: 2 };
@@ -30,21 +58,7 @@ export const registerUser = async (data) => {
     const newUser = new User({ username, email, password });
     await newUser.save();
 
-    const payload = {
-        id: newUser._id,
-        username: newUser.username,
-        email: newUser.email,
-        role: newUser.role,
-        profilePic: newUser.profilePic,
-        totalMediaBytes: newUser.totalMediaBytes || 0
-    };
-
-    const token = jwt.sign(payload, getJwtSecret(), { expiresIn: '7d' });
-
-    return {
-        token,
-        user: payload
-    };
+    return issueSession(newUser);
 };
 
 export const loginUser = async (email, password) => {
@@ -63,21 +77,7 @@ export const loginUser = async (email, password) => {
         throw new Error('Invalid credentials');
     }
 
-    const payload = {
-        id: user._id,
-        username: user.username,
-        email: user.email,
-        role: user.role,
-        profilePic: user.profilePic,
-        totalMediaBytes: user.totalMediaBytes || 0
-    };
-
-    const token = jwt.sign(payload, getJwtSecret(), { expiresIn: '7d' });
-
-    return {
-        token,
-        user: payload
-    };
+    return issueSession(user);
 };
 
 export const updateProfile = async (userId, data) => {
@@ -127,28 +127,7 @@ export const updateProfile = async (userId, data) => {
 
     await user.save();
 
-    const payload = {
-        id: user._id,
-        username: user.username,
-        email: user.email,
-        role: user.role,
-        profilePic: user.profilePic,
-        totalMediaBytes: user.totalMediaBytes || 0
-    };
-
-    const token = jwt.sign(payload, getJwtSecret(), { expiresIn: '7d' });
-
-    return {
-        token,
-        user: {
-            id: user._id,
-            username: user.username,
-            email: user.email,
-            role: user.role,
-            profilePic: user.profilePic,
-            totalMediaBytes: user.totalMediaBytes || 0
-        }
-    };
+    return issueSession(user);
 };
 
 export const deleteAccount = async (userId, confirmEmail) => {
@@ -161,25 +140,63 @@ export const deleteAccount = async (userId, confirmEmail) => {
         throw new Error('Email address does not match');
     }
 
+    // Files to remove from Cloudinary once the records are gone.
+    const filesToDestroy = [];
+
     // Delete user's reviews together with the comments under them, and the
     // comments the user wrote elsewhere, so nothing is left orphaned.
-    const ownReviews = await Review.find({ 'user.id': user._id }).select('_id');
+    const ownReviews = await Review.find({ 'user.id': user._id }).select('_id review.media');
     const ownReviewIds = ownReviews.map(r => r._id);
+    for (const r of ownReviews) {
+        for (const m of r.review?.media || []) {
+            const publicId = publicIdFromUrl(m.url);
+            if (publicId) filesToDestroy.push({ publicId, type: m.type });
+        }
+    }
     await Comment.deleteMany({ $or: [{ reviewId: { $in: ownReviewIds } }, { 'user.id': user._id }] });
     await Review.deleteMany({ _id: { $in: ownReviewIds } });
 
-    // Delete conversations and messages associated with this user
+    // Delete conversations and messages associated with this user. Media sent by
+    // the other participant in those conversations is removed too, and its bytes
+    // are given back to that participant's quota.
     const userConvos = await Conversation.find({ participants: userId });
     const userConvoIds = userConvos.map(c => c._id);
     if (userConvoIds.length > 0) {
+        const mediaMessages = await Message.find({
+            conversationId: { $in: userConvoIds },
+            mediaUrl: { $ne: null }
+        }).select('sender mediaUrl mediaType mediaSize mediaPublicId');
+        for (const msg of mediaMessages) {
+            if (msg.sender && msg.sender.toString() !== user._id.toString() && msg.mediaSize) {
+                await releaseMediaBytes(msg.sender, msg.mediaSize);
+            }
+            const publicId = msg.mediaPublicId || publicIdFromUrl(msg.mediaUrl);
+            if (publicId) filesToDestroy.push({ publicId, type: msg.mediaType });
+        }
+        await ChatUpload.deleteMany({ attachedTo: { $in: mediaMessages.map(m => m._id) } });
         await Message.deleteMany({
             $or: [{ conversationId: { $in: userConvoIds } }, { sender: userId }]
         });
         await Conversation.deleteMany({ participants: userId });
     }
 
+    // Chat uploads the user made but never sent.
+    const unsent = await ChatUpload.find({ owner: user._id, attachedTo: null });
+    for (const u of unsent) filesToDestroy.push({ publicId: u.publicId, type: u.mediaType });
+    await ChatUpload.deleteMany({ owner: user._id });
+
+    const avatarId = publicIdFromUrl(user.profilePic);
+    if (avatarId) filesToDestroy.push({ publicId: avatarId, type: 'image' });
+
     // Delete user document
     await User.findByIdAndDelete(userId);
+
+    // Storage clean-up never fails the deletion itself.
+    await Promise.all(filesToDestroy.map(f =>
+        cloudinaryInstance.uploader
+            .destroy(f.publicId, { resource_type: f.type === 'video' ? 'video' : 'image' })
+            .catch(e => console.error('Could not remove a file of a deleted account:', e.message))
+    ));
 
     return { success: true, message: 'Account deleted successfully' };
 };
@@ -196,21 +213,9 @@ export const resetUserPassword = async (email, newPassword) => {
     }
 
     user.password = newPassword;
+    // Ends every session that existed before the reset (for example a stolen one).
+    user.tokenVersion = (user.tokenVersion || 0) + 1;
     await user.save();
 
-    const payload = {
-        id: user._id,
-        username: user.username,
-        email: user.email,
-        role: user.role,
-        profilePic: user.profilePic,
-        totalMediaBytes: user.totalMediaBytes || 0
-    };
-
-    const token = jwt.sign(payload, getJwtSecret(), { expiresIn: '7d' });
-
-    return {
-        token,
-        user: payload
-    };
+    return issueSession(user);
 };

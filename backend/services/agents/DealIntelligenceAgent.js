@@ -6,6 +6,7 @@ import { escapeRegex } from '../../utils/security.js';
 
 const MAX_CLIENTS_PER_RUN = 5;
 const MAX_TOOL_ROUNDS = 6;
+const ALLOWED_TOOLS = new Set(toolsDeclarations.dealIntelligence.map(t => t.name));
 
 export async function runDealIntelligenceAgent(demoEmail) {
     const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
@@ -22,7 +23,6 @@ export async function runDealIntelligenceAgent(demoEmail) {
              trigger = "Inactive 7+ days";
         }
 
-        const cutoff = new Date(Date.now() - 365 * 24 * 60 * 60 * 1000); // 1 year ago to catch everything!
         const recentNegativesCount = await Review.countDocuments({
             "product.name": { $regex: new RegExp(escapeRegex(client.companyName), 'i') },
             "analytics.sentimentScore": { $lt: 0.5 }
@@ -72,17 +72,29 @@ Rules:
 
             const chat = model.startChat({});
             let response = await chat.sendMessage(`Evaluate client_id: '${client.client_id}' triggered by: '${trigger}'`);
-            
+
+            let rounds = 0;
             while (response.response.functionCalls && response.response.functionCalls()?.length > 0) {
+                // Each round is a paid model call: a model that keeps asking for tools is stopped.
+                if (++rounds > MAX_TOOL_ROUNDS) {
+                    throw new Error(`Agent exceeded ${MAX_TOOL_ROUNDS} tool rounds`);
+                }
                 const parts = [];
                 for (const call of response.response.functionCalls()) {
                     try {
                         console.log(`[Agent Tool Call] ${call.name}`);
-                        
-                        // Hacker override for the email demo!
-                        if (call.name === 'send_reengagement_report' && demoEmail) {
-                            call.args.to_email = demoEmail;
-                            console.log(`[Demo Override] Rerouted email directly to: ${demoEmail}`);
+
+                        // Only this agent's own tools may run (not e.g. send_outreach_email).
+                        if (!ALLOWED_TOOLS.has(call.name)) {
+                            throw new Error(`Unknown tool: ${call.name}`);
+                        }
+                        if (call.name === 'send_reengagement_report') {
+                            // Mail only ever goes to the approved recipient, never to an
+                            // address the model chose; without one, nothing is sent.
+                            if (!demoEmail) {
+                                throw new Error('No approved recipient configured; email was not sent.');
+                            }
+                            call.args = { ...(call.args || {}), to_email: demoEmail };
                         }
 
                         const rawResult = await toolsMap[call.name](call.args);

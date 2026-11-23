@@ -29,9 +29,13 @@ export const requireAuth = async (req, res, next) => {
         if (!decoded?.id || !mongoose.Types.ObjectId.isValid(String(decoded.id))) {
             return res.status(401).json({ success: false, error: 'Invalid token.' });
         }
-        const account = await User.findById(decoded.id).select('username role').lean();
+        const account = await User.findById(decoded.id).select('username role tokenVersion').lean();
         if (!account) {
             return res.status(401).json({ success: false, error: 'Account no longer exists.' });
+        }
+        // A password reset raises tokenVersion; tokens issued before it are void.
+        if ((decoded.tv || 0) !== (account.tokenVersion || 0)) {
+            return res.status(401).json({ success: false, error: 'Session expired. Please sign in again.' });
         }
         req.user = { ...decoded, id: String(decoded.id), username: account.username, role: account.role };
         next();

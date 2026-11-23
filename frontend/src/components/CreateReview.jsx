@@ -1,6 +1,6 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { API_BASE_URL } from '../config';
-import { Camera, MapPin, X, Trash2 } from 'lucide-react';
+import { Camera, Trash2 } from 'lucide-react';
 import BrandAutocomplete, { toPascalCase } from './BrandAutocomplete';
 import CategoryDropdown from './CategoryDropdown';
 import StarRating from './StarRating';
@@ -35,6 +35,20 @@ export default function CreateReview({ onClose, onPostSuccess, editingReview }) 
   const [isAccurateLocation, setIsAccurateLocation] = useState(editingReview?.location?.precision === 'exact');
   const [showLocationPicker, setShowLocationPicker] = useState(false);
   const fileInputRef = React.useRef(null);
+
+  // New files are previewed from blob: URLs. Release each one when it leaves the
+  // list (removed, cleared) and all of them when the form closes.
+  const liveBlobUrls = React.useRef(new Set());
+  useEffect(() => {
+    const current = new Set(mediaItems.map(m => m.url).filter(u => typeof u === 'string' && u.startsWith('blob:')));
+    for (const url of liveBlobUrls.current) {
+      if (!current.has(url)) URL.revokeObjectURL(url);
+    }
+    liveBlobUrls.current = current;
+  }, [mediaItems]);
+  useEffect(() => () => {
+    for (const url of liveBlobUrls.current) URL.revokeObjectURL(url);
+  }, []);
 
   const handleClear = () => {
       setRating(0);

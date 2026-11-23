@@ -1,9 +1,9 @@
 import React, { useState, useEffect } from 'react';
 
 import { API_BASE_URL } from '../config';
-import { Camera, ArrowLeft, Mail, User as UserIcon, Save, AlertCircle, CheckCircle, Edit2, X, Users, UserX, Crop, KeyRound, CheckCircle2 } from 'lucide-react';
+import { Camera, ArrowLeft, Mail, User as UserIcon, Save, AlertCircle, CheckCircle, Edit2, Users, UserX, KeyRound} from 'lucide-react';
 import AvatarCropModal from './AvatarCropModal';
-import { getJsonAuthHeaders, getAuthHeaders, setAuthToken } from '../utils/apiUtils';
+import { getJsonAuthHeaders, getAuthHeaders, setAuthToken, errorMessage, readJson } from '../utils/apiUtils';
 import { useAuth } from '../context/AuthContext';
 import { useModalA11y } from '../utils/a11y';
 
@@ -61,13 +61,13 @@ const [confirmEmailInput, setConfirmEmailInput] = useState('');
         body: JSON.stringify({ email: confirmEmailInput.trim() }),
         credentials: 'include'
       });
-      const data = await res.json();
+      const data = await readJson(res);
 
       if (data.success) {
         setShowDeleteModal(false);
         if (onDeleteAccount) onDeleteAccount();
       } else {
-        throw new Error(data.error || 'Failed to delete account');
+        throw new Error(errorMessage(data, 'Failed to delete account'));
       }
     } catch (err) {
       setDeleteError(err.message || 'Failed to delete account');
@@ -92,6 +92,13 @@ const [confirmEmailInput, setConfirmEmailInput] = useState('');
       e.target.value = '';
     }
   };
+
+  // A cropped picture is previewed from a blob: URL; release it once it is
+  // replaced or the page closes, so the image does not stay in memory.
+  useEffect(() => {
+    if (typeof previewUrl !== 'string' || !previewUrl.startsWith('blob:')) return undefined;
+    return () => URL.revokeObjectURL(previewUrl);
+  }, [previewUrl]);
 
   const handleCropComplete = (croppedFile) => {
     setProfilePicFile(croppedFile);
@@ -147,7 +154,7 @@ const [confirmEmailInput, setConfirmEmailInput] = useState('');
           body: formData,
           credentials: 'include'
       });
-      const data = await res.json();
+      const data = await readJson(res);
       
       if (data.success) {
         if (data.token) {
@@ -161,7 +168,7 @@ const [confirmEmailInput, setConfirmEmailInput] = useState('');
         setProfilePicFile(null);
         setPendingCropFile(null);
       } else {
-        throw new Error(data.error || 'Failed to update profile');
+        throw new Error(errorMessage(data, 'Failed to update profile'));
       }
     } catch (error) {
       if (showEmailOtpModal) {

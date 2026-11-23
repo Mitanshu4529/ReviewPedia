@@ -1,10 +1,8 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { API_BASE_URL } from './config';
 import { useLocation, useNavigate } from 'react-router-dom';
-import { Search, Navigation, Plus, MapPin, BarChart3, ArrowRight, ArrowUpRight, ArrowLeft, Mail, MessageCircle, Crosshair, Hexagon, Youtube, Linkedin, Instagram, Facebook, User as UserIcon, LogOut, ShieldAlert, MessageSquare, XCircle, Layers, Users, Star, CheckCircle2, Calendar, Heart, ChevronDown, Check } from 'lucide-react';
-import { PRODUCT_CATEGORIES } from './utils/mockData';
+import { Search, Plus, MapPin, ArrowRight, ArrowUpRight, ArrowLeft, Mail, Crosshair, Hexagon, Youtube, Linkedin, Instagram, Facebook, CheckCircle2, Calendar, Heart, ChevronDown } from 'lucide-react';
 import AppMap from './components/Map';
-import ReviewCard from './components/ReviewCard';
 import MultiReviewCard from './components/MultiReviewCard';
 import AgentBox from './components/AgentBox';
 import CreateReview from './components/CreateReview';
@@ -20,7 +18,6 @@ import CategorySelectModal from './components/CategorySelectModal';
 import { useAuth } from './context/AuthContext';
 import { useChat } from './context/ChatContext';
 import { formatDate } from './utils/dateUtils';
-import { getReviewUrl } from './utils/urlUtils';
 import { pressable, useModalA11y } from './utils/a11y';
 import './index.css';
 import { notify } from './utils/notify';
@@ -37,7 +34,6 @@ function App() {
   else if (location.pathname.startsWith('/chat')) appMode = 'chat';
   else if (location.pathname.startsWith('/reviews/') || location.pathname.startsWith('/review/')) appMode = 'reviewDetail';
   const [selectedLocationReviews, setSelectedLocationReviews] = useState(null);
-  const [selectedReview, setSelectedReview] = useState(null);
   const [selectedUser, setSelectedUser] = useState(null);
   const [initialChatUser, setInitialChatUser] = useState(null);
   const [isCreatingReview, setIsCreatingReview] = useState(false);
@@ -74,15 +70,20 @@ function App() {
         setIsHomepageProfileOpen(false);
       }
     };
+    // Escape closes the account menu too (keyboard users had no way out).
+    const handleKeyDown = (e) => { if (e.key === 'Escape') setIsHomepageProfileOpen(false); };
     document.addEventListener('mousedown', handleClickOutside);
-    return () => document.removeEventListener('mousedown', handleClickOutside);
+    document.addEventListener('keydown', handleKeyDown);
+    return () => {
+      document.removeEventListener('mousedown', handleClickOutside);
+      document.removeEventListener('keydown', handleKeyDown);
+    };
   }, []);
 
   React.useEffect(() => {
     // Reset all review windows on route change
     setIsCreatingReview(false);
     setEditingReviewData(null);
-    setSelectedReview(null);
     setSelectedLocationReviews(null);
     setIsMyReviewsOpen(false);
 
@@ -109,7 +110,6 @@ function App() {
 
   const openReviewList = async (kind, params) => {
     const requestId = ++reviewListRequest.current;
-    setSelectedReview(null);
     try {
       const page = await fetchReviewPage(params);
       if (requestId !== reviewListRequest.current) return; // a newer list was opened meanwhile
@@ -162,13 +162,6 @@ function App() {
   };
 
   const handleLikeToggle = (reviewId, newLikes) => {
-    setSelectedReview(prev => {
-      if (prev && (prev.id === reviewId || prev._id === reviewId || prev.id?.toString() === reviewId?.toString())) {
-        return { ...prev, likes: newLikes };
-      }
-      return prev;
-    });
-
     setSelectedLocationReviews(prevList => {
       if (!Array.isArray(prevList)) return prevList;
       return prevList.map(r => {
@@ -228,6 +221,8 @@ function App() {
       if (!user) return;
       const userId = user.id || user._id;
       if (!userId) return;
+      // The list is only shown on the consumer map; from Research it switches there first.
+      if (appMode !== 'consumer') navigate('/browse');
       // Asked for by account id on the server. (This used to download the first
       // 500 reviews of everyone and pick out the ones with a matching name.)
       await openReviewList('mine', { userId: String(userId) });
@@ -237,6 +232,12 @@ function App() {
   const noteReviewDeleted = () => {
       setReviewPaging(prev => (prev ? { ...prev, total: Math.max(0, (prev.total || 0) - 1) } : prev));
   };
+
+  // Agent emails may only go to the account's own address (or the configured
+  // demo inbox), so a signed-in user starts with their own address filled in.
+  useEffect(() => {
+      if (user?.email) setMarketResearchEmail(prev => prev || user.email);
+  }, [user?.email]);
 
   const startBusinessMode = () => {
      if (!marketResearchEmail || !marketResearchEmail.includes('@')) {
@@ -947,7 +948,7 @@ function App() {
 
                      {/* Subtitle / Description */}
                      <p style={{ fontSize: '0.92rem', color: '#94a3b8', margin: 0, lineHeight: 1.6 }}>
-                         Enter your email address to securely route AI-generated intelligence briefings and automated sales outreach directly to your inbox for verification.
+                         Enter your email address to securely route AI-generated intelligence briefings and automated sales outreach directly to your inbox for verification. Agent emails can only be delivered to the email address of your signed-in account.
                      </p>
 
                      {/* Input Box Container */}
@@ -1291,7 +1292,6 @@ function App() {
                       setIsCreatingReview(false);
                       setEditingReviewData(null);
                       setMapUpdateTrigger(prev => prev + 1);
-                      setSelectedReview(null);
                       setSelectedLocationReviews(null);
                   }}
               />
@@ -1416,27 +1416,6 @@ function App() {
 
       {appMode === 'business' && <AgentBox demoEmail={marketResearchEmail} isOpen={isAgentOpen} onClose={() => setIsAgentOpen(false)} />}
 
-      {appMode === 'consumer' && selectedReview && (
-        <ReviewCard
-          review={selectedReview}
-          onClose={() => setSelectedReview(null)}
-          onUserClick={(u, userObj) => {
-            const isScraped = selectedReview.source?.isScraped || (selectedReview.source?.platform && selectedReview.source.platform.toLowerCase() !== 'reviewpedia' && selectedReview.source.platform.toLowerCase() !== 'local post');
-            if (!isScraped) setSelectedUser(userObj || u);
-          }}
-          currentUser={user}
-          onDeleteSuccess={() => {
-            setSelectedReview(null);
-            setMapUpdateTrigger(prev => prev + 1);
-          }}
-          onEdit={(rev) => {
-            setEditingReviewData(rev);
-            setIsCreatingReview(true);
-          }}
-          onLikeToggle={handleLikeToggle}
-        />
-      )}
-
       {appMode === 'consumer' && selectedLocationReviews && (
         <MultiReviewCard
           reviews={selectedLocationReviews}
@@ -1492,7 +1471,8 @@ function App() {
             username={typeof selectedUser === 'object' ? (selectedUser.name || selectedUser.username) : selectedUser}
             userProfilePic={typeof selectedUser === 'object' ? selectedUser.profilePic : null}
             onClose={() => setSelectedUser(null)}
-            onChatClick={() => {
+            // No "Chat with" button on your own profile (the server refuses a chat with yourself).
+            onChatClick={user && (typeof selectedUser === 'object' ? (selectedUser.name || selectedUser.username) : selectedUser) === user.username ? undefined : () => {
                 const targetUsername = typeof selectedUser === 'object' ? (selectedUser.name || selectedUser.username) : selectedUser;
                 if (!user) {
                     setShowAuthModal('login');
@@ -1517,6 +1497,7 @@ function App() {
                   setInitialChatUser(null);
               }}
               initialChatUser={initialChatUser}
+              onInitialChatHandled={() => setInitialChatUser(null)}
           />
       )}
 
@@ -1555,7 +1536,6 @@ function App() {
         <ReviewDetailPage
           currentUser={user}
           logout={logout}
-          onOpenMyReviews={handleOpenMyReviews}
           onOpenAuth={(mode) => setShowAuthModal(mode || 'login')}
           onLikeToggle={handleLikeToggle}
           onUserClick={(u, userObj) => setSelectedUser(userObj || u)}

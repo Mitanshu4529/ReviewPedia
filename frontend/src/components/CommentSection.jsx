@@ -1,8 +1,8 @@
 import React, { useState, useEffect } from 'react';
 import { API_BASE_URL } from '../config';
-import { MessageSquare, Heart, CornerDownRight, Trash2, Send, Plus, Minus, User as UserIcon } from 'lucide-react';
+import { MessageSquare, Heart, Trash2, Send, Plus, Minus } from 'lucide-react';
 import { formatDate } from '../utils/dateUtils';
-import { getAuthHeaders, getJsonAuthHeaders } from '../utils/apiUtils';
+import { getAuthHeaders, getJsonAuthHeaders, errorMessage, readJson } from '../utils/apiUtils';
 import { notify } from '../utils/notify';
 
 /**
@@ -25,7 +25,7 @@ function formatTimeAgo(dateStr) {
   if (days < 30) return `${days}d ago`;
   const months = Math.floor(days / 30);
   if (months < 12) return `${months}mo ago`;
-  const years = Math.floor(days / 365);
+  const years = Math.max(1, Math.floor(days / 365));
   return `${years}y ago`;
 }
 
@@ -61,15 +61,18 @@ export default function CommentSection({ reviewId, reviewAuthor, currentUser, on
   const [replyingToId, setReplyingToId] = useState(null);
   const [replyText, setReplyText] = useState('');
   const [collapsedIds, setCollapsedIds] = useState({});
+  // True once the comments were fetched successfully. Until then the review's
+  // own commentsCount stays on screen instead of a temporary (or lasting) 0.
+  const [loaded, setLoaded] = useState(false);
 
   const API_URL = API_BASE_URL;
 
   // Notify parent of comments count
   useEffect(() => {
-    if (onCommentCountChange) {
+    if (loaded && onCommentCountChange) {
       onCommentCountChange(comments.length);
     }
-  }, [comments.length, onCommentCountChange]);
+  }, [loaded, comments.length, onCommentCountChange]);
 
   // Fetch comments for review
   useEffect(() => {
@@ -84,7 +87,10 @@ export default function CommentSection({ reviewId, reviewAuthor, currentUser, on
         });
         if (res.ok) {
           const data = await res.json();
-          if (isMounted) setComments(data);
+          if (isMounted && Array.isArray(data)) {
+            setComments(data);
+            setLoaded(true);
+          }
         }
       } catch (err) {
         console.error('Failed to load comments:', err);
@@ -121,11 +127,11 @@ export default function CommentSection({ reviewId, reviewAuthor, currentUser, on
         setTopCommentText('');
         setIsTopCommentFocused(false);
       } else {
-        const err = await res.json();
-        notify(err.error || 'Failed to post comment');
+        notify(errorMessage(await readJson(res), 'Failed to post comment'));
       }
     } catch (err) {
       console.error('Error posting comment:', err);
+      notify('Could not post the comment. Please check your connection and try again.');
     } finally {
       setIsSubmitting(false);
     }
@@ -154,11 +160,11 @@ export default function CommentSection({ reviewId, reviewAuthor, currentUser, on
         setReplyText('');
         setReplyingToId(null);
       } else {
-        const err = await res.json();
-        notify(err.error || 'Failed to post reply');
+        notify(errorMessage(await readJson(res), 'Failed to post reply'));
       }
     } catch (err) {
       console.error('Error posting reply:', err);
+      notify('Could not post the reply. Please check your connection and try again.');
     } finally {
       setIsSubmitting(false);
     }
@@ -173,7 +179,9 @@ export default function CommentSection({ reviewId, reviewAuthor, currentUser, on
 
     const currentUserId = currentUser.id?.toString() || currentUser._id?.toString() || currentUser.username;
     
-    // Optimistic update
+    // Optimistic update, undone if the server does not confirm it.
+    const previousLikes = comments.find(c => c.id === commentId)?.likes;
+    const rollback = () => setComments(prev => prev.map(c => c.id === commentId ? { ...c, likes: previousLikes } : c));
     setComments(prev => prev.map(c => {
       if (c.id === commentId) {
         const likes = Array.isArray(c.likes) ? c.likes : [];
@@ -192,12 +200,17 @@ export default function CommentSection({ reviewId, reviewAuthor, currentUser, on
         headers: getJsonAuthHeaders(),
         credentials: 'include'
       });
-      if (res.ok) {
-        const data = await res.json();
+      const data = await readJson(res);
+      if (res.ok && Array.isArray(data.likes)) {
         setComments(prev => prev.map(c => c.id === commentId ? { ...c, likes: data.likes } : c));
+      } else {
+        rollback();
+        notify(errorMessage(data, 'Could not update the like.'));
       }
     } catch (err) {
       console.error('Failed to like comment:', err);
+      rollback();
+      notify('Could not update the like. Please check your connection.');
     }
   };
 
@@ -226,11 +239,11 @@ export default function CommentSection({ reviewId, reviewAuthor, currentUser, on
         }
         setComments(prev => prev.filter(c => !toDelete.has(c.id)));
       } else {
-        const err = await res.json();
-        notify(err.error || 'Failed to delete comment');
+        notify(errorMessage(await readJson(res), 'Failed to delete comment'));
       }
     } catch (err) {
       console.error('Error deleting comment:', err);
+      notify('Could not delete the comment. Please check your connection and try again.');
     }
   };
 
@@ -457,7 +470,6 @@ function CommentNode({
 
   const isAuthor = currentUser && (
     (node.user?.id && (currentUser.id?.toString() === node.user.id.toString() || currentUser._id?.toString() === node.user.id.toString())) ||
-    (node.user?.name && currentUser.username === node.user.name) ||
     currentUser.role === 'admin'
   );
 

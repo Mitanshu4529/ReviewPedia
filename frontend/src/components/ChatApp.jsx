@@ -1,67 +1,22 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 
-import { API_BASE_URL, SOCKET_BASE_URL } from '../config';
+import { API_BASE_URL } from '../config';
 import ChatSidebar from './ChatSidebar';
 import ChatWindow from './ChatWindow';
 import LoadingPopup from './LoadingPopup';
-import { io } from 'socket.io-client';
-import { getAuthHeaders, getJsonAuthHeaders, getAuthToken } from '../utils/apiUtils';
+import { getAuthHeaders, getJsonAuthHeaders, errorMessage, readJson } from '../utils/apiUtils';
 import { useChat } from '../context/ChatContext';
+import { notify } from '../utils/notify';
 
-export default function ChatApp({ currentUser, onClose, initialChatUser }) {
-    const [socket, setSocket] = useState(null);
+export default function ChatApp({ currentUser, onClose, initialChatUser, onInitialChatHandled }) {
     const [conversations, setConversations] = useState([]);
     const [isLoadingConversations, setIsLoadingConversations] = useState(true);
     const [activeConversation, setActiveConversation] = useState(null);
-    const [isConnected, setIsConnected] = useState(false);
-    const { markConversationRead, refreshUnreadCount } = useChat();
-    const activeConversationRef = useRef(null);
+    // One realtime connection per signed-in user, shared with the rest of the app
+    // (this page used to open a second socket of its own).
+    const { markConversationRead, refreshUnreadCount, socket } = useChat();
 
-    useEffect(() => {
-        activeConversationRef.current = activeConversation;
-    }, [activeConversation]);
-
-    useEffect(() => {
-        const SOCKET_URL = SOCKET_BASE_URL;
-        // The server authenticates the socket from this token (or the session
-        // cookie) and joins the user's room itself.
-        const newSocket = io(SOCKET_URL, {
-            withCredentials: true,
-            auth: { token: getAuthToken() },
-        });
-
-        newSocket.on('connect', () => {
-            setIsConnected(true);
-        });
-        newSocket.on('connect_error', (err) => {
-            console.error('Chat connection failed:', err.message);
-            setIsConnected(false);
-        });
-
-        newSocket.on('disconnect', () => setIsConnected(false));
-        
-        newSocket.on('receive_message', (message) => {
-            // If the message is for the currently open conversation, mark as read immediately
-            if (activeConversationRef.current && activeConversationRef.current._id === message.conversationId) {
-                markConversationRead(message.conversationId);
-            }
-            fetchConversations();
-        });
-
-        newSocket.on('messages_read', () => {
-            fetchConversations();
-        });
-
-        newSocket.on('message_deleted', () => {
-            fetchConversations();
-        });
-
-        setSocket(newSocket);
-
-        return () => newSocket.close();
-    }, [currentUser, markConversationRead]);
-
-    const fetchConversations = async (showLoading = false) => {
+    const fetchConversations = useCallback(async (showLoading = false) => {
         if (showLoading) setIsLoadingConversations(true);
         try {
             const API_URL = API_BASE_URL;
@@ -78,17 +33,26 @@ export default function ChatApp({ currentUser, onClose, initialChatUser }) {
         } finally {
             setIsLoadingConversations(false);
         }
-    };
+    }, []);
+
+    // Keep the sidebar (last message, unread badges) current. Marking the open
+    // conversation as read is done by ChatWindow, which shows the new message.
+    useEffect(() => {
+        if (!socket) return;
+        const refresh = () => fetchConversations();
+        socket.on('receive_message', refresh);
+        socket.on('messages_read', refresh);
+        socket.on('message_deleted', refresh);
+        return () => {
+            socket.off('receive_message', refresh);
+            socket.off('messages_read', refresh);
+            socket.off('message_deleted', refresh);
+        };
+    }, [socket, fetchConversations]);
 
     useEffect(() => {
         fetchConversations(true);
-    }, []);
-
-    useEffect(() => {
-        if (initialChatUser) {
-            startConversation(initialChatUser);
-        }
-    }, [initialChatUser]);
+    }, [fetchConversations]);
 
     const handleSelectConversation = (convo) => {
         setActiveConversation(convo);
@@ -108,15 +72,28 @@ export default function ChatApp({ currentUser, onClose, initialChatUser }) {
                 credentials: 'include',
                 body: JSON.stringify({ targetUsername })
             });
-            const data = await res.json();
-            if (data.success) {
+            const data = await readJson(res);
+            if (res.ok && data.success) {
                 setActiveConversation(data.conversation);
                 fetchConversations();
+            } else {
+                notify(errorMessage(data, `Could not open a chat with ${targetUsername}.`));
             }
         } catch (e) {
             console.error("Failed to start conversation", e);
+            notify('Could not open the chat. Please check your connection and try again.');
         }
     };
+
+    // Open the chat requested from a profile once, then forget the request so a
+    // later visit to /chat does not reopen it.
+    useEffect(() => {
+        if (initialChatUser) {
+            startConversation(initialChatUser);
+            onInitialChatHandled?.();
+        }
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [initialChatUser]);
 
     const handleConversationDeleted = () => {
         setActiveConversation(null);
@@ -139,7 +116,10 @@ export default function ChatApp({ currentUser, onClose, initialChatUser }) {
                 isLoading={isLoadingConversations}
             />
             {activeConversation ? (
-                <ChatWindow 
+                <ChatWindow
+                    // A fresh window per conversation: a draft, attachments or a late
+                    // response from the previous chat must not carry over.
+                    key={activeConversation._id}
                     conversation={activeConversation} 
                     currentUser={currentUser} 
                     socket={socket} 

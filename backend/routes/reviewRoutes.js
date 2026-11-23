@@ -1,4 +1,5 @@
 import express from 'express';
+import rateLimit from 'express-rate-limit';
 import { 
     getReviews, 
     getMapStats,
@@ -24,8 +25,18 @@ router.get('/map-stats', getMapStats);
 // The quota gate runs before multer, so nothing reaches Cloudinary for a caller who is out of space.
 router.post('/', requireAuth, checkUploadQuota(), upload.array('images', 10), createReview);
 
-// Link preview metadata
-router.post('/fetch-metadata', requireAuth, getLinkMetadata);
+// Link preview metadata. Each call makes the server fetch an outside page, so
+// it is rate limited per account to keep it from being used as a free proxy.
+const metadataLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 60,
+    keyGenerator: (req) => req.user.id, // requireAuth runs first
+    message: { success: false, error: 'Too many link previews requested, please try again later.' },
+    standardHeaders: true,
+    legacyHeaders: false,
+    skip: () => process.env.NODE_ENV === 'test'
+});
+router.post('/fetch-metadata', requireAuth, metadataLimiter, getLinkMetadata);
 
 // Review details and likes
 router.get('/:id', getReviewById);

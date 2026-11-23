@@ -1,6 +1,6 @@
 import { useModalA11y } from '../utils/a11y';
 import React, {useState, useRef, useEffect } from 'react';
-import { ZoomIn, ZoomOut, RotateCw, RotateCcw, Check, X, Move, Camera } from 'lucide-react';
+import { ZoomIn, ZoomOut, RotateCw, RotateCcw, Check, X} from 'lucide-react';
 
 export default function AvatarCropModal({ imageFile, imageSrcUrl, onCropComplete, onCancel }) {
   const [imageSrc, setImageSrc] = useState(null);
@@ -44,9 +44,11 @@ export default function AvatarCropModal({ imageFile, imageSrcUrl, onCropComplete
     };
   }, [imageFile, imageSrcUrl]);
 
-  // Handle Drag / Pan (Mouse & Touch)
+  // Handle Drag / Pan (Mouse & Touch). Touch scrolling of the page is stopped
+  // by `touch-action: none` on the viewport (React touch listeners are passive,
+  // so preventDefault() there has no effect).
   const handleMouseDown = (e) => {
-    e.preventDefault();
+    if (!e.touches) e.preventDefault();
     setIsDragging(true);
     const clientX = e.touches ? e.touches[0].clientX : e.clientX;
     const clientY = e.touches ? e.touches[0].clientY : e.clientY;
@@ -69,12 +71,20 @@ export default function AvatarCropModal({ imageFile, imageSrcUrl, onCropComplete
     setIsDragging(false);
   };
 
-  // Wheel zoom
-  const handleWheel = (e) => {
-    e.preventDefault();
-    const delta = e.deltaY * -0.002;
-    setZoom((prev) => Math.min(Math.max(1, prev + delta), 3));
-  };
+  // Wheel zoom. Bound natively with { passive: false }: React's onWheel is
+  // passive, so the page used to scroll along with every zoom step.
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return undefined;
+    const handleWheel = (e) => {
+      e.preventDefault();
+      const delta = e.deltaY * -0.002;
+      setZoom((prev) => Math.min(Math.max(1, prev + delta), 3));
+    };
+    el.addEventListener('wheel', handleWheel, { passive: false });
+    return () => el.removeEventListener('wheel', handleWheel);
+    // The viewport only exists once the image is ready (see the early return below).
+  }, [imageSrc]);
 
   const handleRotate = () => {
     setRotation((prev) => (prev + 90) % 360);
@@ -179,7 +189,6 @@ export default function AvatarCropModal({ imageFile, imageSrcUrl, onCropComplete
           onTouchStart={handleMouseDown}
           onTouchMove={handleMouseMove}
           onTouchEnd={handleMouseUp}
-          onWheel={handleWheel}
           style={{
             position: 'relative',
             width: `${VIEWPORT_SIZE}px`,

@@ -2,11 +2,45 @@ import mongoose from 'mongoose';
 import Conversation from '../models/Conversation.js';
 import Message from '../models/Message.js';
 import User from '../models/User.js';
-import { cloudinaryInstance, MAX_MEDIA_LIMIT, STORAGE_LIMIT_MESSAGE } from '../middlewares/uploadMiddleware.js';
+import ChatUpload from '../models/ChatUpload.js';
+import { cloudinaryInstance, STORAGE_LIMIT_MESSAGE, reserveMediaBytes, releaseMediaBytes } from '../middlewares/uploadMiddleware.js';
 import { isValidObjectId, isOwnCloudinaryUrl } from '../utils/security.js';
 
 const MAX_MESSAGE_LENGTH = 5000;
-const MAX_CHAT_MEDIA_BYTES = 25 * 1024 * 1024; // matches the upload limit
+const CHAT_FOLDER = 'reviewpedia_chat';
+const MESSAGE_PAGE_SIZE = 500;
+
+/**
+ * Public ID for messages stored before uploads were recorded server-side.
+ * Only files in the chat folder qualify, so an old message can never be used
+ * to delete a review image or profile picture.
+ */
+const legacyChatPublicId = (url) => {
+    if (!isOwnCloudinaryUrl(url)) return null;
+    const parts = url.split('/');
+    const filename = (parts.pop() || '').split('.')[0];
+    const folder = parts.pop();
+    return folder === CHAT_FOLDER && filename ? `${folder}/${filename}` : null;
+};
+
+/** Removes a message's media file and gives its bytes back to the sender's quota. */
+const removeMessageMedia = async (msg) => {
+    if (!msg.mediaUrl) return;
+    if (msg.mediaSize && msg.sender) {
+        await releaseMediaBytes(msg.sender, msg.mediaSize);
+    }
+    const publicId = msg.mediaPublicId || legacyChatPublicId(msg.mediaUrl);
+    if (publicId) {
+        try {
+            await cloudinaryInstance.uploader.destroy(publicId, {
+                resource_type: msg.mediaType === 'video' ? 'video' : 'image'
+            });
+        } catch (cloudinaryErr) {
+            console.error("Error deleting message media from Cloudinary:", cloudinaryErr);
+        }
+    }
+    await ChatUpload.deleteOne({ attachedTo: msg._id });
+};
 
 // Loads a conversation and verifies the caller is one of its participants.
 // Sends the error response itself and returns null when access is not allowed.
@@ -155,23 +189,29 @@ export const createOrGetConversation = async (req, res, next) => {
         if (!conversation) {
             // To prevent race conditions (like React StrictMode sending 2 rapid requests),
             // we use an atomic findOneAndUpdate with an exact sorted array match and upsert.
-            const p1 = currentUserId.toString();
-            const p2 = targetUser._id.toString();
-            const sortedParticipants = [p1, p2].sort();
+            // The unique pairKey index makes the losing request of a race fail with
+            // a duplicate-key error; it then reads the conversation the winner made.
+            const sortedParticipants = [currentUserId.toString(), targetUser._id.toString()].sort();
+            const pairKey = sortedParticipants.join('_');
+            let created;
+            try {
+                created = await Conversation.findOneAndUpdate(
+                    { pairKey },
+                    {
+                        $setOnInsert: {
+                            participants: sortedParticipants,
+                            lastMessage: "Conversation started",
+                            lastMessageAt: Date.now()
+                        }
+                    },
+                    { new: true, upsert: true }
+                );
+            } catch (upsertErr) {
+                if (upsertErr?.code !== 11000) throw upsertErr;
+                created = await Conversation.findOne({ pairKey });
+            }
 
-            conversation = await Conversation.findOneAndUpdate(
-                { participants: sortedParticipants },
-                { 
-                    $setOnInsert: { 
-                        lastMessage: "Conversation started",
-                        lastMessageAt: Date.now()
-                    }
-                },
-                { new: true, upsert: true }
-            );
-            
-            // Populate after upsert
-            conversation = await Conversation.findById(conversation._id).populate('participants', 'username _id profilePic');
+            conversation = await Conversation.findById(created._id).populate('participants', 'username _id profilePic');
         }
 
         const doc = conversation.toObject();
@@ -217,9 +257,18 @@ export const getMessages = async (req, res, next) => {
             io.to(userId.toString()).emit('unread_count_update', { conversationId });
         }
 
-        const rawMessages = await Message.find({ conversationId })
+        // The newest MESSAGE_PAGE_SIZE messages, oldest first. `?before=<ISO date>`
+        // returns the page before that point, so a long conversation is never
+        // loaded into memory in one go.
+        const filter = { conversationId };
+        const before = typeof req.query.before === 'string' ? new Date(req.query.before) : null;
+        if (before && !Number.isNaN(before.getTime())) filter.createdAt = { $lt: before };
+        const rawMessages = (await Message.find(filter)
             .populate('sender', 'username _id profilePic')
-            .sort({ createdAt: 1 });
+            .sort({ createdAt: -1 })
+            .limit(MESSAGE_PAGE_SIZE + 1)).reverse();
+        const hasMore = rawMessages.length > MESSAGE_PAGE_SIZE;
+        if (hasMore) rawMessages.shift();
 
         const messages = rawMessages.map(msg => {
             const doc = msg.toObject();
@@ -229,7 +278,7 @@ export const getMessages = async (req, res, next) => {
             return doc;
         });
 
-        res.json({ success: true, messages });
+        res.json({ success: true, messages, hasMore });
     } catch (err) {
         next(err);
     }
@@ -243,26 +292,37 @@ export const uploadChatMedia = async (req, res, next) => {
         }
 
         const fileSize = req.file.size || req.file.bytes || 0;
-        const userDoc = await User.findById(req.user.id);
+        const mediaType = req.file.mimetype?.startsWith('video/') ? 'video' : 'image';
+        const discardFile = () => req.file.filename
+            ? cloudinaryInstance.uploader
+                .destroy(req.file.filename, { resource_type: mediaType })
+                .catch(e => console.error('Cloudinary cleanup failed', e))
+            : Promise.resolve();
 
         // checkUploadQuota already refused requests that could not fit before the
-        // upload started; this is the exact check on the real size. A file that
-        // still does not fit is removed again instead of being left orphaned.
-        if (userDoc && (userDoc.totalMediaBytes || 0) + fileSize > MAX_MEDIA_LIMIT) {
-            if (req.file.filename) {
-                await cloudinaryInstance.uploader
-                    .destroy(req.file.filename, { resource_type: req.file.mimetype?.startsWith('video/') ? 'video' : 'image' })
-                    .catch(e => console.error('Cloudinary cleanup failed', e));
-            }
+        // upload started. The real size is charged here, atomically, at upload time,
+        // so uploading without ever sending a message cannot bypass the quota.
+        if (!(await reserveMediaBytes(req.user.id, fileSize))) {
+            await discardFile();
             return res.status(400).json({ error: { message: STORAGE_LIMIT_MESSAGE } });
         }
-        
-        let mediaType = 'none';
-        if (req.file.mimetype.startsWith('image/')) mediaType = 'image';
-        else if (req.file.mimetype.startsWith('video/')) mediaType = 'video';
 
-        res.json({ 
-            success: true, 
+        try {
+            await ChatUpload.create({
+                owner: req.user.id,
+                url: req.file.path,
+                publicId: req.file.filename,
+                mediaType,
+                size: fileSize
+            });
+        } catch (recordErr) {
+            await releaseMediaBytes(req.user.id, fileSize);
+            await discardFile();
+            throw recordErr;
+        }
+
+        res.json({
+            success: true,
             mediaUrl: req.file.path,
             mediaType,
             mediaSize: fileSize
@@ -287,28 +347,6 @@ export const sendMessage = async (req, res, next) => {
             return res.status(400).json({ error: { message: `Message is too long (max ${MAX_MESSAGE_LENGTH} characters)` } });
         }
 
-        // Media must be a file uploaded to this app's own Cloudinary account, and
-        // its size must be a sane positive number (a negative size would let a
-        // client shrink its storage-quota counter).
-        let mediaUrl = null;
-        let mediaSize = 0;
-        let safeMediaType = 'none';
-        if (req.body.mediaUrl) {
-            if (!isOwnCloudinaryUrl(req.body.mediaUrl)) {
-                return res.status(400).json({ error: { message: "Invalid media URL" } });
-            }
-            if (mediaType !== 'image' && mediaType !== 'video') {
-                return res.status(400).json({ error: { message: "Invalid media type" } });
-            }
-            const size = Number(req.body.mediaSize);
-            if (!Number.isFinite(size) || size < 0 || size > MAX_CHAT_MEDIA_BYTES) {
-                return res.status(400).json({ error: { message: "Invalid media size" } });
-            }
-            mediaUrl = req.body.mediaUrl;
-            mediaSize = Math.round(size);
-            safeMediaType = mediaType;
-        }
-
         let safeLocation;
         if (location && typeof location === 'object') {
             const lat = Number(location.lat);
@@ -317,40 +355,54 @@ export const sendMessage = async (req, res, next) => {
                 return res.status(400).json({ error: { message: "Invalid location" } });
             }
             safeLocation = { lat, lng, address: typeof location.address === 'string' ? location.address.slice(0, 300) : undefined };
-            if (!mediaUrl) safeMediaType = 'location';
         }
 
-        if (!text && !mediaUrl && !safeLocation) {
+        if (!text && !req.body.mediaUrl && !safeLocation) {
             return res.status(400).json({ error: { message: "Message is empty" } });
         }
 
-        if (mediaSize) {
-            // Conditional $inc: the quota check and the update are one atomic step,
-            // so parallel messages cannot push the sender past the limit.
-            const reserved = await User.findOneAndUpdate(
-                { _id: senderId, $expr: { $lte: [{ $add: [{ $ifNull: ['$totalMediaBytes', 0] }, mediaSize] }, MAX_MEDIA_LIMIT] } },
-                { $inc: { totalMediaBytes: mediaSize } }
+        // Media must be a file the sender uploaded through /api/chat/upload and has
+        // not attached to another message yet. URL, size, type and public ID all
+        // come from that server-side record; the client's mediaType/mediaSize are
+        // ignored. The upload was already charged to the quota when it was stored.
+        const messageId = new mongoose.Types.ObjectId();
+        let upload = null;
+        if (req.body.mediaUrl) {
+            if (typeof req.body.mediaUrl !== 'string' || !isOwnCloudinaryUrl(req.body.mediaUrl)) {
+                return res.status(400).json({ error: { message: "Invalid media URL" } });
+            }
+            if (mediaType !== undefined && mediaType !== 'image' && mediaType !== 'video') {
+                return res.status(400).json({ error: { message: "Invalid media type" } });
+            }
+            upload = await ChatUpload.findOneAndUpdate(
+                { url: req.body.mediaUrl, owner: senderId, attachedTo: null },
+                { $set: { attachedTo: messageId } },
+                { new: true }
             );
-            if (!reserved) {
-                return res.status(400).json({ error: { message: STORAGE_LIMIT_MESSAGE } });
+            if (!upload) {
+                return res.status(400).json({ error: { message: "Media must be uploaded by you before it can be sent" } });
             }
         }
+        const mediaUrl = upload ? upload.url : null;
+        const mediaSize = upload ? upload.size : 0;
+        let safeMediaType = upload ? upload.mediaType : (safeLocation ? 'location' : 'none');
 
         let message;
         try {
             message = await Message.create({
+                _id: messageId,
                 conversationId,
                 sender: senderId,
                 text,
                 mediaUrl,
                 mediaType: safeMediaType,
                 mediaSize,
+                mediaPublicId: upload ? upload.publicId : null,
                 location: safeLocation
             });
         } catch (createErr) {
-            if (mediaSize) {
-                await User.findByIdAndUpdate(senderId, { $inc: { totalMediaBytes: -mediaSize } });
-            }
+            // Give the upload back so the user can retry sending it.
+            if (upload) await ChatUpload.updateOne({ _id: upload._id }, { $set: { attachedTo: null } });
             throw createErr;
         }
 
@@ -394,28 +446,7 @@ export const deleteConversation = async (req, res, next) => {
         // Find all messages in the conversation to delete media
         const messages = await Message.find({ conversationId });
         for (const msg of messages) {
-            if (msg.mediaUrl) {
-                if (msg.mediaSize && msg.sender) {
-                    const userDoc = await User.findById(msg.sender);
-                    if (userDoc) {
-                        const newTotal = Math.max(0, (userDoc.totalMediaBytes || 0) - msg.mediaSize);
-                        await User.findByIdAndUpdate(userDoc._id, { totalMediaBytes: newTotal });
-                    }
-                }
-                try {
-                    // Extract public ID from Cloudinary URL (assumes folder structure is present)
-                    const parts = msg.mediaUrl.split('/');
-                    const filename = parts.pop().split('.')[0];
-                    const folder = parts.pop();
-                    const publicId = `${folder}/${filename}`;
-                    
-                    await cloudinaryInstance.uploader.destroy(publicId, { 
-                        resource_type: msg.mediaType === 'video' ? 'video' : 'image' 
-                    });
-                } catch (cloudinaryErr) {
-                    console.error("Error deleting media from Cloudinary:", cloudinaryErr);
-                }
-            }
+            await removeMessageMedia(msg);
         }
 
         // Delete all messages
@@ -449,27 +480,7 @@ export const deleteMessage = async (req, res, next) => {
         }
 
         // Delete from Cloudinary if media exists
-        if (message.mediaUrl) {
-            if (message.mediaSize) {
-                const userDoc = await User.findById(message.sender);
-                if (userDoc) {
-                    const newTotal = Math.max(0, (userDoc.totalMediaBytes || 0) - message.mediaSize);
-                    await User.findByIdAndUpdate(userDoc._id, { totalMediaBytes: newTotal });
-                }
-            }
-            try {
-                const parts = message.mediaUrl.split('/');
-                const filename = parts.pop().split('.')[0];
-                const folder = parts.pop();
-                const publicId = `${folder}/${filename}`;
-                
-                await cloudinaryInstance.uploader.destroy(publicId, { 
-                    resource_type: message.mediaType === 'video' ? 'video' : 'image' 
-                });
-            } catch (cloudinaryErr) {
-                console.error("Error deleting message media from Cloudinary:", cloudinaryErr);
-            }
-        }
+        await removeMessageMedia(message);
 
         const conversationId = message.conversationId;
 
@@ -484,7 +495,8 @@ export const deleteMessage = async (req, res, next) => {
         let newLastMessage = "Conversation started";
         if (remainingMessages.length > 0) {
             const lastMsg = remainingMessages[0];
-            newLastMessage = lastMsg.text || `[Attached ${lastMsg.mediaType}]`;
+            newLastMessage = lastMsg.text
+                || (lastMsg.mediaUrl ? `[Attached ${lastMsg.mediaType}]` : lastMsg.location?.lat != null ? '[Shared Location]' : '');
         }
 
         await Conversation.findByIdAndUpdate(conversationId, {

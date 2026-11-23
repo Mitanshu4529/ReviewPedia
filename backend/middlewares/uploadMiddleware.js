@@ -67,6 +67,30 @@ const allowedMimeTypes = [
   'video/webm'
 ];
 
+/**
+ * Atomically reserves `bytes` of the user's media quota. Resolves true when the
+ * bytes fit and were added, false when they would exceed the limit.
+ */
+export const reserveMediaBytes = async (userId, bytes) => {
+  if (!bytes) return true;
+  const reserved = await User.findOneAndUpdate(
+    { _id: userId, $expr: { $lte: [{ $add: [{ $ifNull: ['$totalMediaBytes', 0] }, bytes] }, MAX_MEDIA_LIMIT] } },
+    { $inc: { totalMediaBytes: bytes } }
+  );
+  return !!reserved;
+};
+
+/**
+ * Atomically gives `bytes` of quota back, never going below zero. A single
+ * update, so a concurrent reservation by another request is not lost.
+ */
+export const releaseMediaBytes = async (userId, bytes) => {
+  if (!userId || !bytes) return;
+  await User.updateOne({ _id: userId }, [
+    { $set: { totalMediaBytes: { $max: [0, { $subtract: [{ $ifNull: ['$totalMediaBytes', 0] }, bytes] }] } } }
+  ]);
+};
+
 const quotaError = () => {
   const err = new Error(STORAGE_LIMIT_MESSAGE);
   err.status = 400;

@@ -9,3 +9,6 @@ dist-ssr/
 *.local
 .vscode/
 
+
+# Local editor / agent tooling
+.claude/

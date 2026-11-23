@@ -1,5 +1,5 @@
 import React from 'react';
-import { ArrowLeft, User as UserIcon } from 'lucide-react';
+import { ArrowLeft } from 'lucide-react';
 import { pressable } from '../utils/a11y';
 
 export default function ChatSidebar({ conversations, activeConversation, onSelectConversation, onClose, currentUser, isLoading }) {
